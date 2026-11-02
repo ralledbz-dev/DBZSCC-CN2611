@@ -1,0 +1,17 @@
+.venv/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+media/
+.dbzs/*.db
+.dbzs/*.sqlite
+.dbzs/*.sqlite3
+.dbzs/*.log

@@ -1,0 +1,28 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbzscc-2611"
+version = "0.1.0"
+description = "Local-first desktop engineering workspace"
+requires-python = ">=3.10"
+dependencies = ["PySide6>=6.7"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.4"]
+
+[project.scripts]
+dbzscc-2611 = "dbzscc.app.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
