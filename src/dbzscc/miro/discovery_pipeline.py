@@ -44,6 +44,11 @@ class LocalDiscoveryResult:
     registry_sync: RegistrySyncResult
     artifacts: tuple[LocalDiscoveryArtifact, ...]
     scanner_issues: tuple[ScanIssue, ...]
+    directories_visited: int
+    entries_seen: int
+    regular_files_seen: int
+    reparse_points_skipped: int
+    access_denied_directories: int
 
     @property
     def has_partial_results(self) -> bool:
@@ -180,6 +185,11 @@ def run_local_discovery(
         registry_sync=sync_result,
         artifacts=tuple(discovered),
         scanner_issues=inventory.issues,
+        directories_visited=inventory.directories_visited,
+        entries_seen=inventory.entries_seen,
+        regular_files_seen=inventory.regular_files_seen,
+        reparse_points_skipped=inventory.reparse_points_skipped,
+        access_denied_directories=inventory.access_denied_directories,
     )
 
 

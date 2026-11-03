@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import threading
@@ -9,7 +10,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import (
+    HTTPRedirectHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+    urlopen,
+)
 
 from .config import AppSettings
 
@@ -20,6 +28,34 @@ class ChatProviderError(RuntimeError):
 
 class ChatStreamCancelled(RuntimeError):
     """The caller explicitly cancelled an in-flight chat stream."""
+
+
+def is_loopback_endpoint(endpoint: str) -> bool:
+    """Return whether a validated HTTP(S) endpoint targets a loopback address."""
+    try:
+        normalized = AppSettings(model_endpoint=endpoint).validated_endpoint()
+        host = urlsplit(normalized).hostname
+        if not host:
+            return False
+        if host.casefold() == "localhost":
+            return True
+        return ipaddress.ip_address(host).is_loopback
+    except (TypeError, ValueError):
+        return False
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Prevent a local context request from being redirected to another host."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _open_url(request: Request, timeout: float, *, local_only: bool):
+    if not local_only:
+        return urlopen(request, timeout=timeout)
+    opener = build_opener(ProxyHandler({}), _NoRedirectHandler())
+    return opener.open(request, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -88,14 +124,54 @@ class OpenAICompatibleClient:
             raise ChatProviderError("Die Runtime lieferte eine leere Antwort.")
         return content.strip()
 
+    def complete_local(self, model: str, messages: tuple[ChatMessage, ...]) -> str:
+        """Complete one request with redirects and proxies disabled on loopback."""
+        if not is_loopback_endpoint(self.endpoint):
+            raise ChatProviderError(
+                "Lokale Workflow-Anfragen sind nur an einen Loopback-Endpunkt erlaubt."
+            )
+        selected_model = model.strip()
+        if not selected_model:
+            raise ValueError("Bitte zuerst ein Modell auswählen oder eintragen.")
+        if not messages:
+            raise ValueError("Mindestens eine Chat-Nachricht ist erforderlich.")
+        payload = self._request(
+            "POST",
+            f"{self.endpoint}/chat/completions",
+            {
+                "model": selected_model,
+                "messages": [
+                    {"role": message.role, "content": message.content}
+                    for message in messages
+                ],
+                "stream": False,
+            },
+            local_only=True,
+        )
+        try:
+            content = payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ChatProviderError(
+                "Die Runtime-Antwort enthält keine Chat-Nachricht."
+            ) from exc
+        if not isinstance(content, str) or not content.strip():
+            raise ChatProviderError("Die Runtime lieferte eine leere Antwort.")
+        return content.strip()
+
     def stream_complete(
         self,
         model: str,
         messages: tuple[ChatMessage, ...],
         on_delta: Callable[[str], None],
         cancel_event: threading.Event,
+        *,
+        local_only: bool = False,
     ) -> str:
         """Stream one text completion, returning only after the SSE [DONE] marker."""
+        if local_only and not is_loopback_endpoint(self.endpoint):
+            raise ChatProviderError(
+                "Projektdateien dürfen ausschließlich an einen Loopbackserver gesendet werden."
+            )
         selected_model = model.strip()
         if not selected_model:
             raise ValueError("Bitte zuerst ein Modell auswählen oder eintragen.")
@@ -126,7 +202,9 @@ class OpenAICompatibleClient:
         pending_data: list[str] = []
         completed = False
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
+            with _open_url(
+                request, timeout=self.timeout_seconds, local_only=local_only
+            ) as response:
                 while True:
                     if cancel_event.is_set():
                         raise ChatStreamCancelled("Chat-Stream abgebrochen.")
@@ -212,7 +290,31 @@ class OpenAICompatibleClient:
             parts.append(content)
             on_delta(content)
 
-    def _request(self, method: str, url: str, body: dict | None = None) -> dict:
+    def _request(
+        self,
+        method: str,
+        url: str,
+        body: dict | None = None,
+        *,
+        local_only: bool = False,
+    ) -> dict:
+        if local_only:
+            request_parts = urlsplit(url)
+            endpoint_parts = urlsplit(self.endpoint)
+            request_origin = (
+                request_parts.scheme,
+                request_parts.hostname,
+                request_parts.port,
+            )
+            endpoint_origin = (
+                endpoint_parts.scheme,
+                endpoint_parts.hostname,
+                endpoint_parts.port,
+            )
+            if not is_loopback_endpoint(self.endpoint) or request_origin != endpoint_origin:
+                raise ChatProviderError(
+                    "Lokale Workflow-Anfragen sind nur an denselben Loopback-Endpunkt erlaubt."
+                )
         headers = {"Accept": "application/json"}
         data = None
         if body is not None:
@@ -223,7 +325,9 @@ class OpenAICompatibleClient:
             headers["Authorization"] = f"Bearer {api_key}"
         request = Request(url, data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
+            with _open_url(
+                request, timeout=self.timeout_seconds, local_only=local_only
+            ) as response:
                 response_bytes = response.read()
         except HTTPError as exc:
             raise ChatProviderError(

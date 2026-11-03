@@ -142,6 +142,7 @@ def test_one_pass_joins_inventory_parse_registry_and_capability_evidence(
 
 class _MutatingScanner(LocalInventoryScanner):
     def __init__(self, path: Path) -> None:
+        super().__init__()
         self.path = path
 
     def scan(self, model_roots=(), runtime_roots=()):

@@ -1,0 +1,81 @@
+# DBZSCC 2611 — Lokales Memory und begrenzter Read-only-Schwarm
+
+## Kurz gesagt
+
+Dieser eigenständige Engineering-Slice ergänzt zwei Qt-freie Bausteine: ein lokales SQLite-Register für kurze, abstrahierte Projektkenntnisse und einen begrenzten Parallelkern für unabhängige Read-only-Aufgaben. Beide sind **noch nicht** in Chat, UI, Runtime, automatische Extraktion oder den bestehenden App-Speicher eingehängt. Zusätzlich priorisiert diese Doku einen kleinen lokalen LLM-Orchestrator als **Architekturvariante, nicht als implementierte Funktion**.
+
+Das Memory ist modellunabhängig, weil es als normale lokale Datenbank zwischen austauschbaren Modellen und Workern bestehen kann. Das macht Modellgewichte nicht trainierter und beweist nicht, dass sich ein Agent selbstständig oder unabhängig vom Modell verbessert. Es ermöglicht lediglich, bestätigtes Wissen über Aufgaben und Modellwechsel hinweg erneut abzurufen.
+
+## Lokale Kenntnisspeicherung
+
+`src/dbzscc/app/local_memory.py` stellt `LocalMemoryStore` bereit. Der Aufrufer gibt den Datenbankpfad ausdrücklich vor; es gibt keinen automatischen Scan und keinen Standardpfad, der Nutzerdaten einsammelt. Ein Eintrag enthält eine kurze Zusammenfassung, abgegrenzten Wissensbereich und Typ, Konfidenz, Herkunftskategorie und opake UUID-Quellenreferenz sowie Erstellungs- und letzte Bestätigungszeit.
+
+Neue Einträge starten immer als `pending_review`. Sie erscheinen weder in `list_entries()` noch in `search()` als Fakten. Erst `confirm()` setzt den Status auf `confirmed` und notiert den Bestätigungszeitpunkt. `mark_stale()` und `mark_unknown()` nehmen einen Eintrag aus der Faktensuche; `list_entries(include_non_facts=True)` zeigt solche Einträge zur Prüfung. `delete()` entfernt den Datensatz hart aus der lokalen Tabelle. Suchtreffer enthalten sowohl die Provenienz als auch die tatsächlich passenden Suchwörter.
+
+Es gibt absichtlich keinen Adapter, der Chatverläufe, persönliche Daten, Secrets oder rohe Dateiinhalte einspeist. Der Dienst akzeptiert ausschließlich eine begrenzte, einzeilige Abstraktion und UUID-Referenzen; einfache Musterprüfungen blockieren erkennbare E-Mail-Adressen, Telefonnummern, Secret-Zuweisungen und lokale Pfade. Das ist eine defensive Hürde, **kein vollständiger PII-/Secret-Detektor**: spätere Aufrufer müssen vor dem Persistieren Inhalte abstrahieren und sensible Informationen ausschließen. Der Request-Text einer Frage, Dateitext und Modellprompt werden durch diesen Slice nicht gespeichert.
+
+## Begrenzter Parallelkern
+
+`src/dbzscc/app/readonly_swarm.py` bietet `ReadOnlyTask`, einen injizierbaren `ReadOnlyWorker`-Vertrag und `ReadOnlySwarm`. Ein Batch enthält höchstens 16 typisierte Aufgaben ohne Abhängigkeits-/Rekursionsfeld; die `ThreadPoolExecutor`-Parallelität ist auf 1–4 Threads begrenzt. Jede Aufgabe hat ein Timeout von höchstens 30 Sekunden; ein Batch höchstens 60 Sekunden. Aufrufer können ein Abbruch-Event übergeben oder `cancel()` aus einem anderen Thread aufrufen. Fehler einer Aufgabe werden auf kontrollierte Fehlercodes reduziert und beeinträchtigen die übrigen Ergebnisse nicht.
+
+Worker liefern begrenzte Aussagen mit opaker Quellenreferenz und Konfidenz. `SwarmReport` erhält je Aufgabe Status, Workerkennung, Herkunftsreferenzen und Unsicherheiten. Widersprüchliche Aussagen mit gleichem Thema bleiben als einzelne, provenance-gebundene Claims in `conflicts` erhalten; es gibt keine Mehrheitsabstimmung, die Uneinigkeit versteckt.
+
+Der Kern übergibt Workern keine Dateisystem-, Schreib-, Shell-, Netzwerk- oder sonstigen Tool-Services und interpretiert Nutzereingaben nicht als ausführbaren Code. Im Slice gibt es ausschließlich deterministische Test-Fake-Worker; es gibt keine echte Modellinferenz, keine Toolausführung und keine externe Anfrage. Eine spätere lokale Modell-Worker-Implementierung kann den Vertrag austauschen, ist aber nicht enthalten. Die Worker laufen als vertrauenswürdiger Python-Code im selben Prozess; `ThreadPoolExecutor` kann einen nicht kooperativen Thread nicht gewaltsam beenden. Timeout und Abbruch signalisieren kooperative Beendigung und begrenzen die zurückgemeldete Wartezeit, sind aber keine Prozess-Sandbox.
+
+## Priorisierte Architekturvariante: lokales Workflow-LLM — nur entworfen
+
+**Priorität:** nächster Orchestrierungs-Entwurf nach dem sicheren Service-/Provenienzvertrag; nicht Teil des aktuell implementierten Slices. Ein kleines lokales Agent-LLM kann eine ausdrücklich gestartete Anfrage in eine Intent-Klasse, einen begrenzten Plan und Vorschläge für bekannte Workflow-IDs übersetzen. „Klein“ ist ein zu benchmarkendes lokales Modellprofil, keine hier belegte Modell-/Hardwarefähigkeit.
+
+Das Modell ist ausschließlich Planungs- und Routinghilfe. Seine Ausgabe gilt als nicht vertrauenswürdiger Vorschlag; ein deterministisches Workflow-Register mit versionierten, typisierten Eingaben, erlaubten Zustandsübergängen und Capability-/Policy-Gates entscheidet, ob ein bekannter Ablauf überhaupt ausführbar ist. Nur registrierte Aktionen dürfen an dedizierte Services weitergereicht werden. Freier Modelltext, Toolnamen, Pfade, Shell-Befehle oder generierter Code werden weder interpretiert noch ausgeführt. Unbekannte Workflow-IDs, ungültige Schemas, überschrittene Schritt-/Zeitlimits und nicht erfüllte Berechtigungen führen geschlossen zum Abbruch, nicht zu einem improvisierten Fallback.
+
+Jeder Workflow beginnt mit einer sichtbaren Nutzeraktion. Ein automatisierter oder geplanter Ablauf darf erst später existieren, wenn der Nutzer ihn ausdrücklich konfiguriert und aktiviert hat; es gibt keine stillen Hintergrundaktionen oder vom Modell selbst eingerichteten Trigger. Risikoarme, rein lesende Abläufe können nach dem konkreten Nutzerstart innerhalb einer Allowlist laufen. Für Änderungen braucht es mindestens Vorschau und separate Bestätigung; externe, destructive oder sonst hochwirksame Aktionen benötigen eine frische, an genau den geprüften Payload gebundene Freigabe. Services prüfen Policy und Berechtigung unmittelbar vor Ausführung erneut.
+
+Nur begrenzte Metadaten sollen nach einer separaten Speicherentscheidung persistieren: Workflow-ID/-Version, Triggerart und expliziter Auslöser, Correlation-/Task-IDs, tatsächlich gewählte typisierte Aktion, Modellkennung/-version, Ergebnis-/Fehlercode, Provenienz und relevante Zeitpunkte. Vollständige Chatprompts, rohe Dateiinhalte, Secrets und ungeprüfte Modellpläne gehören nicht in den Run- oder Memory-Speicher. Eine bestätigte abstrakte Erkenntnis kann später als separater Memory-Kandidat zur Review angeboten werden; Modellgewichte werden durch gelöste Aufgaben nicht automatisch trainiert oder angepasst.
+
+**Abnahmekriterien für einen späteren Implementierungsslice:**
+
+- Feste Workflow-Registry und versionierte Ein-/Ausgabeschemas; nur allowlistete IDs/Aktionen sind aufrufbar. Fake-Modelltests belegen, dass beliebiger Text, Shell-Inhalt, Code, unbekannte Tools und Prompt-Injection keinen Ausführungspfad öffnen.
+- Modellplan und Schema werden vor jeder Ausführung deterministisch validiert; ungültige Ausgabe, Timeout, fehlender lokaler Runtime-Zustand und Worker-Fehler erzeugen einen begrenzten sichtbaren Fehler ohne stillen Providerwechsel.
+- Policy-Matrix prüft mindestens Read-only, Dateiänderung, externe Kommunikation und destruktive/hochwirksame Aktion. Nicht freigegebene sowie abgelehnte Aktionen ändern keinen Zustand; Änderungsfreigaben sind an den angezeigten Diff/Payload gebunden.
+- Jeder Run erhält stabile Run-/Correlation-IDs und kontrollierte Provenienz einschließlich Nutzertrigger oder ausdrücklich aktivierter Automation, Workflowversion, Modellauswahl, Status und Ergebnis-Evidence. Es werden keine vollständigen Prompts oder Secrets persistiert; Löschung und Retention sind getestet.
+- Standard ist ein sichtbarer nutzergetriggerter Workflow. Tests belegen, dass ohne explizite Aktivierung kein Scheduler/Trigger im Hintergrund startet und dass ein Workflow keine weiteren Agenten oder Aktionen rekursiv erzeugt.
+- Austauschbare Worker bleiben lokal und durch Ressourcen-/Latenztests geprüft. Mindestens ein Offline-End-to-End-Test belegt die Kette Intent → validierter Plan → registrierter Read-only-Service → Provenienzbericht; Modellgewichte bleiben unverändert.
+
+## Optionales späteres Gate: kuratiertes lokales Adaptertraining — nicht im Slice
+
+Ein eigenes Modell könnte künftig zusätzlich angepasst werden, aber das wäre echtes Parametertraining und nicht dasselbe wie das modellunabhängige Memory. Für kontinuierliche Nutzbarkeit ist Memory die sichere erste Stufe: bestätigte Fakten lassen sich sofort zwischen Modellen teilen, ohne Gewichte zu verändern. Nicht jede Frage und Antwort sollte live in einen Trainingsdatensatz fließen. Das würde ungeprüfte, private, fehlerhafte oder manipulierte Inhalte in dauerhaft veränderte Parameter überführen.
+
+Falls später begründet, sollte eine **separate, zeitlich getrennte lokale Batch-Pipeline** nur hochqualitative, redigierte und menschlich bestätigte Beispiele aus einer kuratierten Datenbank verwenden. Der Basismodell-Checkpoint bleibt unverändert; trainiert wird ein versionierter LoRA-/QLoRA-Adapter. Trainingsjobs werden sichtbar und ausdrücklich gestartet oder nur nach eigener Nutzerkonfiguration geplant. Auf derselben GPU laufen sie nicht gleichzeitig mit Modellinferenz; ein Ressourcen- und Prozess-Preflight muss aktive Inferenz erkennen und den Job andernfalls ablehnen oder bis zu einem freigegebenen Wartungsfenster verschieben.
+
+Die [TRL-PEFT-Dokumentation](https://huggingface.co/docs/trl/en/peft_integration) beschreibt LoRA/QLoRA als Fine-Tuning kleiner Zusatzparameter bei eingefrorenen Basisgewichten. Der dokumentierte [SFTTrainer-Modellvertrag](https://huggingface.co/docs/trl/en/sft_trainer) nimmt eine Modell-ID bzw. ein Verzeichnis mit `save_pretrained`-Gewichten oder ein `PreTrainedModel`-/`PeftModel`-Objekt entgegen. Die vorhandenen Projektmodelle sind überwiegend GGUF-Inferenzdateien; die TRL-Schnittstelle belegt **kein direktes Fine-Tuning dieser GGUF-Dateien**. Ein geeigneter, lizenzierter Trainingscheckpoint und ein exakt geprüfter Format-/Adapterpfad müssten separat bereitgestellt werden.
+
+Die vorhandenen Geräteangaben für RAZOR (GTX 1650 Super mit 4 GB VRAM und 32 GB RAM) sind kein Nachweis für den Speicherbedarf eines bestimmten Trainingslaufs. Selbst QLoRA erlaubt keine pauschale Zusage, dass ein konkreter Checkpoint, Sequenzlänge, Batch und Optimizer dort passen oder brauchbare Laufzeit erreichen. Das muss für den exakten lokalen Checkpoint, Backend und Windows-/CUDA-Stack gemessen werden. Die [empirische Continual-Tuning-Studie](https://arxiv.org/abs/2308.08747) berichtet beobachtetes catastrophic forgetting bei untersuchten Modellen von 1B–7B Parametern; das ist ein reales Evaluationsrisiko, aber kein Beweis für das exakte Verhalten eines künftigen DBZSCC-Adapters.
+
+**Abnahmekriterien für diesen optionalen Gate:**
+
+- Trainingsbeispiele stammen ausschließlich aus einem separat kuratierten und redigierten Dataset. Jede Aufnahme hat Quellenreferenz, menschlichen Reviewstatus und Lösch-/Korrekturpfad; Chatverläufe, Secrets, persönliche Daten oder rohe Dateiinhalte werden nicht automatisch übernommen. Ein später gelöschter Ursprung invalidiert die abgeleitete Dataset-Version und erfordert, falls nötig, Adapter-Rücknahme oder Neuaufbau; „Unlearning“ wird nicht versprochen.
+- Basismodell, Datasetrevision und daraus erzeugter Adapter haben Hashes/Versionen und dokumentierte Lizenz/Herkunft; das Basismodell wird nie überschrieben. Hyperparameter, Runtime, Hardware, Zustimmung und Ergebnis werden als begrenzte Run-Provenienz erfasst, nicht als kompletter Prompt.
+- Training ist ein eigener Prozess mit explizitem Nutzerstart, Zeit-/Ressourcenlimit und ohne gleichzeitige Inferenz auf derselben GPU. Es gibt keine heimlichen „train after every answer“-Jobs und keinen stillen Austausch des Standardmodells.
+- Feste Holdout-/Regressionstests laufen vor und nach dem Training; Akzeptanzschwellen, Qualitäts-/Sicherheitstests und Rückfall auf die vorherige Adapterversion sind vorab definiert. Bei Regression oder Abbruch bleibt das aktuelle Modell unverändert.
+- Die lokale Machbarkeit wird anhand eines konkreten kompatiblen Checkpoints und des tatsächlich verfügbaren Backends gemessen. TRL/PEFT/BitsAndBytes oder andere Trainingspakete werden erst in einem separaten Implementierungsschritt versions- und lizenzgeprüft; in diesem Slice wurde nichts installiert und kein Training ausgeführt.
+
+## Schnittstellen und offene Integrationsgaps
+
+- **Bestehende App-Datenhaltung:** `LocalMemoryStore` braucht einen ausdrücklich vorgegebenen SQLite-Pfad und besitzt eine neue Tabelle; es wählt nicht automatisch die Konversationsdatenbank aus und migriert kein bestehendes Schema. Vor Integration müssen der vorhandene Store, IDs, Retention und Datenbankbesitz geprüft werden, damit kein konkurrierender Projekt-/Statusspeicher entsteht.
+- **Sichere Extraktion:** Eine spätere Extraktion darf nur aus einer konkret ausgewählten Aufgabe oder ausdrücklich freigegebenen Quelle innerhalb eines sichtbaren Workflows laufen. Rohtext bleibt flüchtiger Kontext; ein Extraktor erzeugt eine kurze, redigierte Kandidatenabstraktion plus stabile Quellenreferenz. Kandidaten landen ausschließlich als `pending_review`; weder Trefferkonfidenz noch erfolgreiche Aufgabe bestätigen sie automatisch. Konfidenz im aktuellen Contract ist Metadatum, keine kalibrierte Wahrscheinlichkeit.
+- **Konflikt, Freshness und Löschung:** Der Schwarm bewahrt widersprüchliche Claims einschließlich Worker- und Quellenreferenzen. Das Memory-Modul dedupliziert oder erkennt Konflikte noch nicht; widersprüchliche Kandidaten müssen getrennt bleiben und bis zur Klärung `unknown`/nicht-faktisch sein. Provenienzverweise sind opake UUIDs; eine spätere Integration muss sicherstellen, dass die referenzierte Evidence tatsächlich abrufbar ist. Aktuell erfolgen Stale-/Unknown-Markierung und Löschung explizit; automatische Freshness-Prüfung, Retention-Cascade und Konfliktauflösung fehlen.
+- **Suche und Orchestrierung:** Die aktuelle Memory-Suche ist lokale tokenbasierte Suche, kein FTS5-/Embedding-/Vektorsystem. Ein künftiger LangChain-Core-Adapter bleibt optional hinter dem frameworkneutralen Vertrag; keine Pflichtabhängigkeit und keine Abkürzung an den lokalen Services/Policy-Gates vorbei. Die geplante Brave-Suche ist ein externer Sonderfall: nur nach ausdrücklicher Freigabe der exakten Query, und nur Query/erlaubte Parameter gehen an Brave — niemals Gesprächsverlauf, Dateiinhalt, Code oder Credentials. Details zu den geplanten Gates stehen in [LC1](DBZSCC2611_PRODUCTION_READINESS.md) und [W1/Brave](DBZSCC2611_PRODUCTION_READINESS.md).
+
+## Grenzen und nächster Integrationsschritt
+
+Diese Module etablieren weder automatische Memory-Extraktion noch einen gemeinsamen Projektgraphen, FTS-/Vektorsuche, das oben nur entworfene Adaptertraining, LangGraph-Checkpointing, Scheduler, UI-Freigabe oder Produktionsreife. Eine Produktintegration muss zuerst die bestehende lokale Datenhaltung und Identitäts-/Provenienzverträge prüfen, einen expliziten Nutzerprüfpfad und Retention-/Löschregeln festlegen und sicherstellen, dass nur abstrahierte, freigegebene Erkenntnisse angeboten werden. Der Schwarm sollte nur klar abgegrenzte, voneinander unabhängige Aufgaben mit dem kleinsten nötigen Kontext erhalten.
+
+Der Slice ändert keine bestehende UI-, Roadmap- oder App-Dokumentationsdatei. Der übergreifende Status und offene Produktionsgates bleiben im [Produktreifebericht](DBZSCC2611_PRODUCTION_READINESS.md) und in der [App-Implementierungsdokumentation](DBZSCC2611_APP_IMPLEMENTATION.md) maßgeblich.
+
+## Prüfungen
+
+Die fokussierten Fälle nutzen temporäre SQLite-Dateien und deterministische Fake-Worker. Die nachstehenden vollständigen Prüfungen liefen im projektspezifischen Windows-venv und benötigten weder ein echtes Modell noch Netzwerkzugriff.
+
+- `.venv\Scripts\python.exe -m pytest -p no:cacheprovider -q` → **Exitcode 0; 137 passed in 2.11 s**.
+- `.venv\Scripts\ruff.exe check src\dbzscc tests` → **Exitcode 0; All checks passed!**
+- Keine echte Runtime, Modellinferenz, externe Anfrage, Paketinstallation oder Modelltraining wurden in diesem Slice ausgeführt.

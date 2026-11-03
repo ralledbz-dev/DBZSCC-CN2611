@@ -22,6 +22,41 @@ _ARCHITECTURE_PROPERTIES = (
     ("attention_head_count", "attention.head_count"),
     ("key_value_head_count", "attention.head_count_kv"),
 )
+_IMAGE_ARCHITECTURES = frozenset(
+    {
+        "deepseek2",
+        "gemma3",
+        "internvl",
+        "llava",
+        "llava_next",
+        "mllama",
+        "minicpmv",
+        "ovis",
+        "pixtral",
+        "qwen2vl",
+        "qwen2_5vl",
+        "qwen3vl",
+        "qwen3_5vl",
+    }
+)
+_AUDIO_ARCHITECTURES = frozenset(
+    {
+        "audio",
+        "audiocpp",
+        "kokoro",
+        "parakeet",
+        "qwen2audio",
+        "qwen2_audio",
+        "whisper",
+        "wav",
+    }
+)
+_IMAGE_PROJECTOR_KEYS = frozenset(
+    {"clip.projector_type", "clip.has_vision_encoder", "clip.has_llava_projector"}
+)
+_AUDIO_PROJECTOR_KEYS = frozenset(
+    {"audio.projector_type", "audio.has_projector", "audio.projector"}
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +96,13 @@ class CapabilityProfile:
         "matching_model_projector_pair",
         "image_end_to_end_test",
     )
+    image_status: str = "not_indicated"
+    image_role: str = "not_indicated"
+    image_evidence_keys: tuple[str, ...] = ()
+    audio_status: str = "not_indicated"
+    audio_role: str = "not_indicated"
+    audio_evidence_keys: tuple[str, ...] = ()
+    text_only_status: str = "not_verified"
 
 
 def extract_gguf_capability_evidence(
@@ -75,6 +117,9 @@ def extract_gguf_capability_evidence(
     """
     identity = normalize_gguf_identity(document)
     fields = {item.key: item for item in document.fields}
+    image_status, image_role, image_keys, audio_status, audio_role, audio_keys = (
+        _classify_modality_metadata(fields, identity.normalized_architecture)
+    )
     evidence: list[CapabilityEvidence] = []
     issues: list[CapabilityExtractionIssue] = []
 
@@ -158,6 +203,61 @@ def extract_gguf_capability_evidence(
         identity=identity,
         metadata_evidence=tuple(sorted(evidence, key=lambda item: item.source_offset)),
         issues=tuple(sorted(issues, key=lambda item: item.source_offset)),
+        image_status=image_status,
+        image_role=image_role,
+        image_evidence_keys=image_keys,
+        audio_status=audio_status,
+        audio_role=audio_role,
+        audio_evidence_keys=audio_keys,
+    )
+
+
+def _classify_modality_metadata(
+    fields: dict[str, GGUFMetadataField], architecture: str | None
+) -> tuple[str, str, tuple[str, ...], str, str, tuple[str, ...]]:
+    """Classify metadata candidates only; this never asserts runtime support."""
+    image_keys = tuple(
+        sorted(
+            key
+            for key in fields
+            if key in _IMAGE_PROJECTOR_KEYS
+            or key.startswith(("clip.vision.", "vision.", "image."))
+        )
+    )
+    image_architecture_match = architecture in _IMAGE_ARCHITECTURES
+    projector_marker = bool(image_keys)
+    if image_architecture_match and projector_marker:
+        image_status, image_role = "metadata_candidate", "base_and_projector_candidate"
+    elif image_architecture_match:
+        image_status, image_role = "metadata_candidate", "base_model_candidate"
+    elif projector_marker:
+        image_status, image_role = "metadata_candidate", "projector_candidate"
+    else:
+        image_status, image_role = "not_indicated", "not_indicated"
+
+    audio_keys = tuple(
+        sorted(
+            key
+            for key in fields
+            if key.startswith(("audio.", "whisper.", "encoder.audio.", "decoder.audio."))
+        )
+    )
+    audio_architecture_match = architecture in _AUDIO_ARCHITECTURES
+    audio_projector_marker = any(key in _AUDIO_PROJECTOR_KEYS for key in audio_keys)
+    if audio_projector_marker:
+        audio_status, audio_role = "metadata_candidate", "projector_candidate"
+    elif audio_architecture_match or audio_keys:
+        audio_status, audio_role = "metadata_candidate", "base_model_candidate"
+    else:
+        audio_status, audio_role = "not_indicated", "not_indicated"
+
+    return (
+        image_status,
+        image_role,
+        image_keys,
+        audio_status,
+        audio_role,
+        audio_keys,
     )
 
 

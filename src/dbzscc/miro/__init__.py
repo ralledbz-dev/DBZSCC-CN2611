@@ -32,6 +32,7 @@ from .model_registry import (
     RegistrySyncResult,
     normalize_gguf_identity,
 )
+from .multimodal_pairing import MultimodalPairCandidate, pair_multimodal_candidates
 
 __all__ = [
     "ArtifactObservationRecord",
@@ -50,6 +51,7 @@ __all__ = [
     "LocalInventoryScanner",
     "LocalModelRegistry",
     "ModelRecord",
+    "MultimodalPairCandidate",
     "NormalizedModelIdentity",
     "RegistryError",
     "RegistrySchemaError",
@@ -58,4 +60,5 @@ __all__ = [
     "ScanIssue",
     "extract_gguf_capability_evidence",
     "normalize_gguf_identity",
+    "pair_multimodal_candidates",
 ]

@@ -40,6 +40,14 @@ _SELECTED_METADATA_KEYS = (
     "general.quantization_version",
     "general.parameter_count",
     "general.size_label",
+    "clip.projector_type",
+    "clip.model_architecture",
+    "clip.projector_architecture",
+    "clip.has_vision_encoder",
+    "audio.projector_type",
+    "audio.model_architecture",
+    "audio.projector_architecture",
+    "audio.has_projector",
 )
 
 _MIGRATION_1 = (

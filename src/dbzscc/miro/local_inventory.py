@@ -7,8 +7,10 @@ open artifact contents, execute tools, or infer that a discovered file works.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import stat
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,6 +55,24 @@ class InventoryScan:
     scanned_at: datetime
     artifacts: tuple[LocalArtifact, ...]
     issues: tuple[ScanIssue, ...]
+    directories_visited: int = 0
+    entries_seen: int = 0
+    regular_files_seen: int = 0
+    reparse_points_skipped: int = 0
+    access_denied_directories: int = 0
+
+
+@dataclass
+class _ScanBudget:
+    deadline: float
+    entries: int = 0
+    candidates: int = 0
+    directories_visited: int = 0
+    regular_files_seen: int = 0
+    reparse_points_skipped: int = 0
+    access_denied_directories: int = 0
+    exhausted: bool = False
+    limit_reported: bool = False
 
 
 class LocalInventoryScanner:
@@ -64,6 +84,52 @@ class LocalInventoryScanner:
     Symlinks and Windows reparse points are not traversed.
     """
 
+    def __init__(
+        self,
+        *,
+        max_depth: int | None = None,
+        max_entries: int = 100_000,
+        max_candidates: int = 2_000,
+        max_elapsed_seconds: float = 120.0,
+        excluded_directory_names: Iterable[str] = (),
+    ) -> None:
+        for name, value in (
+            ("max_entries", max_entries),
+            ("max_candidates", max_candidates),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer.")
+        if max_depth is not None and (
+            isinstance(max_depth, bool)
+            or not isinstance(max_depth, int)
+            or max_depth <= 0
+        ):
+            raise ValueError("max_depth must be None or a positive integer.")
+        if (
+            isinstance(max_elapsed_seconds, bool)
+            or not isinstance(max_elapsed_seconds, (int, float))
+            or not math.isfinite(max_elapsed_seconds)
+            or max_elapsed_seconds <= 0
+        ):
+            raise ValueError("max_elapsed_seconds must be finite and positive.")
+        if isinstance(excluded_directory_names, (str, bytes)):
+            raise TypeError("excluded_directory_names must be an iterable of names.")
+        excluded = tuple(excluded_directory_names)
+        if not all(
+            isinstance(name, str)
+            and name
+            and name not in {".", ".."}
+            and "/" not in name
+            and "\\" not in name
+            for name in excluded
+        ):
+            raise ValueError("excluded_directory_names must contain simple directory names.")
+        self._max_depth = max_depth
+        self._max_entries = max_entries
+        self._max_candidates = max_candidates
+        self._max_elapsed_seconds = max_elapsed_seconds
+        self._excluded_directory_names = frozenset(name.casefold() for name in excluded)
+
     def scan(
         self,
         model_roots: Iterable[RootInput] = (),
@@ -72,11 +138,14 @@ class LocalInventoryScanner:
         artifacts: dict[str, LocalArtifact] = {}
         issues = []
         visited_roots = set()
+        budget = _ScanBudget(deadline=time.monotonic() + self._max_elapsed_seconds)
 
         for category, configured_roots in (
             ("model", model_roots),
             ("runtime", runtime_roots),
         ):
+            if budget.exhausted:
+                break
             if isinstance(configured_roots, (str, os.PathLike)):
                 roots = (configured_roots,)
             else:
@@ -94,6 +163,8 @@ class LocalInventoryScanner:
                     continue
 
             for raw_root in roots:
+                if budget.exhausted:
+                    break
                 try:
                     root = Path(raw_root).expanduser()
                     root_display = os.path.abspath(os.fspath(root))
@@ -128,7 +199,11 @@ class LocalInventoryScanner:
                 except OSError as exc:
                     issues.append(
                         ScanIssue(
-                            code="root_stat_failed",
+                            code=(
+                                "root_access_denied"
+                                if isinstance(exc, PermissionError)
+                                else "root_stat_failed"
+                            ),
                             root=root_display,
                             path=None,
                             detail=_error_detail(exc),
@@ -163,6 +238,11 @@ class LocalInventoryScanner:
                     category=category,
                     artifacts=artifacts,
                     issues=issues,
+                    budget=budget,
+                    max_depth=self._max_depth,
+                    max_entries=self._max_entries,
+                    max_candidates=self._max_candidates,
+                    excluded_directory_names=self._excluded_directory_names,
                 )
 
         ordered_artifacts = tuple(
@@ -175,6 +255,11 @@ class LocalInventoryScanner:
             scanned_at=datetime.now(timezone.utc),
             artifacts=ordered_artifacts,
             issues=tuple(issues),
+            directories_visited=budget.directories_visited,
+            entries_seen=budget.entries,
+            regular_files_seen=budget.regular_files_seen,
+            reparse_points_skipped=budget.reparse_points_skipped,
+            access_denied_directories=budget.access_denied_directories,
         )
 
     @staticmethod
@@ -184,18 +269,58 @@ class LocalInventoryScanner:
         category: str,
         artifacts: dict[str, LocalArtifact],
         issues: list[ScanIssue],
+        budget: _ScanBudget,
+        max_depth: int | None,
+        max_entries: int,
+        max_candidates: int,
+        excluded_directory_names: frozenset[str],
     ) -> None:
         pending_directories = [root]
+        depth_issue_reported = False
 
-        while pending_directories:
+        def stop_for_limit(code: str, path: str, detail: str) -> None:
+            budget.exhausted = True
+            if not budget.limit_reported:
+                issues.append(
+                    ScanIssue(code=code, root=root_display, path=path, detail=detail)
+                )
+                budget.limit_reported = True
+
+        while pending_directories and not budget.exhausted:
             directory = pending_directories.pop()
+            budget.directories_visited += 1
+            entries = []
+            time_expired = False
             try:
                 with os.scandir(directory) as iterator:
-                    entries = list(iterator)
+                    for entry in iterator:
+                        if time.monotonic() >= budget.deadline:
+                            stop_for_limit(
+                                "scan_time_limit_reached",
+                                os.path.abspath(os.fspath(directory)),
+                                "Discovery stopped after reaching its time budget.",
+                            )
+                            time_expired = True
+                            break
+                        if budget.entries >= max_entries:
+                            stop_for_limit(
+                                "entry_limit_reached",
+                                os.path.abspath(os.fspath(directory)),
+                                "Discovery stopped after reaching its entry budget.",
+                            )
+                            break
+                        budget.entries += 1
+                        entries.append(entry)
             except OSError as exc:
+                if isinstance(exc, PermissionError):
+                    budget.access_denied_directories += 1
                 issues.append(
                     ScanIssue(
-                        code="directory_read_failed",
+                        code=(
+                            "directory_access_denied"
+                            if isinstance(exc, PermissionError)
+                            else "directory_read_failed"
+                        ),
                         root=root_display,
                         path=os.path.abspath(os.fspath(directory)),
                         detail=_error_detail(exc),
@@ -203,15 +328,28 @@ class LocalInventoryScanner:
                 )
                 continue
 
+            if time_expired:
+                return
             entries.sort(key=lambda entry: (entry.name.casefold(), entry.name))
             child_directories = []
             for entry in entries:
+                if time.monotonic() >= budget.deadline:
+                    stop_for_limit(
+                        "scan_time_limit_reached",
+                        os.path.abspath(os.fspath(directory)),
+                        "Discovery stopped after reaching its time budget.",
+                    )
+                    break
                 try:
                     file_stat = entry.stat(follow_symlinks=False)
                 except OSError as exc:
                     issues.append(
                         ScanIssue(
-                            code="entry_stat_failed",
+                            code=(
+                                "entry_access_denied"
+                                if isinstance(exc, PermissionError)
+                                else "entry_stat_failed"
+                            ),
                             root=root_display,
                             path=os.path.abspath(entry.path),
                             detail=_error_detail(exc),
@@ -220,16 +358,40 @@ class LocalInventoryScanner:
                     continue
 
                 if _is_link_or_reparse_point(file_stat):
+                    budget.reparse_points_skipped += 1
                     continue
                 if stat.S_ISDIR(file_stat.st_mode):
-                    child_directories.append(Path(entry.path))
+                    if entry.name.casefold() in excluded_directory_names:
+                        continue
+                    depth = len(Path(directory).relative_to(root).parts)
+                    if max_depth is not None and depth >= max_depth:
+                        if not depth_issue_reported:
+                            issues.append(
+                                ScanIssue(
+                                    code="depth_limit_reached",
+                                    root=root_display,
+                                    path=os.path.abspath(entry.path),
+                                    detail="Deeper directories were not traversed.",
+                                )
+                            )
+                            depth_issue_reported = True
+                    else:
+                        child_directories.append(Path(entry.path))
                     continue
                 if not stat.S_ISREG(file_stat.st_mode):
                     continue
+                budget.regular_files_seen += 1
 
                 classification = _classify_candidate(entry.name, category)
                 if classification is None:
                     continue
+                if budget.candidates >= max_candidates:
+                    stop_for_limit(
+                        "candidate_limit_reached",
+                        os.path.abspath(entry.path),
+                        "Discovery stopped after reaching its candidate budget.",
+                    )
+                    break
 
                 kind, evidence = classification
                 absolute_path = os.path.abspath(entry.path)
@@ -249,7 +411,10 @@ class LocalInventoryScanner:
                 # Overlapping configured roots should not duplicate one artifact.
                 # The first configured root remains the recorded provenance.
                 artifacts.setdefault(artifact_id, artifact)
+                budget.candidates += 1
 
+            if budget.exhausted:
+                return
             pending_directories.extend(reversed(child_directories))
 
 

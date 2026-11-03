@@ -104,6 +104,59 @@ def test_filename_and_model_display_name_do_not_create_capability_claims(
     assert profile.metadata_evidence == ()
     assert profile.runtime_tested_capabilities == ()
     assert profile.multimodal_status == "not_verified"
+    assert profile.image_status == "not_indicated"
+    assert profile.audio_status == "not_indicated"
+    assert profile.text_only_status == "not_verified"
+
+
+def test_image_and_audio_candidates_require_separate_gguf_metadata_evidence(
+    tmp_path: Path,
+) -> None:
+    image_model = _gguf(
+        tmp_path / "ordinary-model.gguf",
+        [
+            _entry("general.architecture", 8, _string("qwen2vl")),
+            _entry("general.name", 8, _string("Neutral model label")),
+        ],
+    )
+    projector = _gguf(
+        tmp_path / "ordinary-projector.gguf",
+        [
+            _entry("general.architecture", 8, _string("clip")),
+            _entry("clip.projector_type", 8, _string("mlp")),
+        ],
+    )
+    audio_model = _gguf(
+        tmp_path / "not-an-audio-name.gguf",
+        [_entry("general.architecture", 8, _string("whisper"))],
+    )
+    name_only = _gguf(
+        tmp_path / "vision-audio-mmproj.gguf",
+        [
+            _entry("general.architecture", 8, _string("qwen3")),
+            _entry("general.name", 8, _string("Vision audio projector model")),
+        ],
+    )
+
+    image_profile = _read_profile(image_model)
+    projector_profile = _read_profile(projector)
+    audio_profile = _read_profile(audio_model)
+    name_only_profile = _read_profile(name_only)
+
+    assert image_profile.image_status == "metadata_candidate"
+    assert image_profile.image_role == "base_model_candidate"
+    assert image_profile.audio_status == "not_indicated"
+    assert image_profile.multimodal_status == "not_verified"
+    assert projector_profile.image_status == "metadata_candidate"
+    assert projector_profile.image_role == "projector_candidate"
+    assert "clip.projector_type" in projector_profile.image_evidence_keys
+    assert projector_profile.audio_status == "not_indicated"
+    assert audio_profile.audio_status == "metadata_candidate"
+    assert audio_profile.audio_role == "base_model_candidate"
+    assert audio_profile.image_status == "not_indicated"
+    assert name_only_profile.image_status == "not_indicated"
+    assert name_only_profile.audio_status == "not_indicated"
+    assert name_only_profile.text_only_status == "not_verified"
 
 
 def test_rejects_wrong_types_and_non_positive_architecture_values(tmp_path: Path) -> None:

@@ -20,6 +20,14 @@ Folgende Regeln sind bindend:
 4. Neue Arbeit wird bei Knappheit gequeued oder abgewiesen, nicht durch harten Kill eines aktiven Jobs „freigemacht“.
 5. `parallel=1` bleibt gültig, bis der konkrete b8842-Build die Slot-/KV-Semantik und Peakbilanz separat belegt.
 
+### Nutzerangabe zur Adapterrolle und typischen Displaylast (Nachtrag 03.11.2026)
+
+**Konfigurationsannahmen des Nutzers, nicht in `Hardware.XML` gemessen:** Die AMD-iGPU betreibt die Systemmonitore; an der NVIDIA-GPU hängen keine Monitore, daher soll NVIDIA der bevorzugte dedizierte Compute-Pfad sein. Für die iGPU nennt der Nutzer 4 GiB zugewiesenen Speicher und im Durchschnitt etwa 300 MiB Displayverbrauch. Die Werte beschreiben die gemeldete Konfiguration und typische Last, nicht den aktuellen OS-/Vulkan-Budgetstand. Sie begründen insbesondere keine feste Zusage von 3,7 GiB freiem iGPU-Speicher.
+
+Eine RAZOR-Diagnose hat AMD-iGPU und GTX 1650 SUPER als getrennte Vulkan-Geräte aufgelistet; `nvidia-smi` meldete 4096 MiB dedizierten NVIDIA-Speicher. Diese Geräteabfragen haben weder die aktiven Monitorausgänge der Adapter zugeordnet noch das iGPU-LOCAL-/NON_LOCAL-Budget gemessen. Die Rollenangabe bleibt deshalb bis zur Laufzeitprüfung eine Nutzerannahme.
+
+Scheduler-Folgen: iGPU-Compute darf den gemeldeten Rest als **mögliche** Ressource berücksichtigen, aber nur innerhalb des aktuellen, adapterbezogenen OS-/Vulkan-Budgets und nach einer dynamischen Display-/Desktopreserve. Die berichteten 300 MiB sind ein typischer Ausgangswert, keine fixe Abzugszahl. NVIDIA wird bevorzugt, jedoch nie ohne Governor, Treiber-/Fremdprozess-Headroom oder bis zum OOM ausgereizt. CPU-Threads werden dynamisch aus aktueller CPU-Last, logischer Kapazität, verfügbarem physischem RAM und Commit-Headroom abgeleitet; hohe Last oder RAM-/Commitdruck senken das Budget und führen zu `QUEUE`/`REJECT_CAPACITY`. Unbekannte oder veraltete Telemetrie führt zu `DEFER_TELEMETRY` beziehungsweise zu einer explizit konservativen Obergrenze. iGPU, NVIDIA, CPU und RAM bilden keinen gemeinsamen VRAM-Pool; Backend- oder Multi-GPU-Verteilung bleibt unbehauptet, bis sie mit der eingebauten Runtime und realen Geräten getestet wurde.
+
 ## 2. Bestehende Verantwortung und gezielte Erweiterung
 
 | Verantwortlichkeit | Istbestand | Erweiterung / klare Grenze |
@@ -27,7 +35,7 @@ Folgende Regeln sind bindend:
 | Modellidentität | `runtime.py`, `ModelVaultDB` | Beibehalten. Optional versionierte Peakprofile nach Modell-, `mmproj`-, Executable-, Backend-, Geräte- und Profilfingerprint ergänzen. Keine zweite Modelldatenbank. |
 | Rollenauflösung | `runtime_assignment_resolver.py` | Kandidaten aus expliziten Rollen liefern; danach Admission abfragen. Resolver startet keine Prozesse, rät keine Geräte und reserviert keinen Speicher. |
 | Startvertrag | `runtime_contract.py`, `RuntimeProfile` | Profil um Backend, `device_key`, Fingerprints und Policy-Version ergänzen; aktuelle Kontext-/Batch-/UBatch-/Threadwerte bleiben Planparameter. |
-| Geräteinventar | nicht als bindende Schicht vorhanden | Neues kleines **`device_registry.py`** als deklaratives Inventar: `cuda:0→NVIDIA`, `vulkan:0→AMD`, `vulkan:1→NVIDIA`, `cpu`. Keine Telemetrie und keine Rateroutine. |
+| Geräteinventar | nicht als bindende Schicht vorhanden | Neues kleines **`device_registry.py`** als deklaratives Inventar: Adapteridentität über verifizierte PCI-/LUID-Zuordnung binden; `cuda:0`/`vulkan:0`/`vulkan:1` sind Laufzeit-IDs, keine stabilen Hardware-IDs. Keine Zuordnung allein nach Listenreihenfolge oder Anzeigename. |
 | Telemetrie | `hardware_monitor.py` für UI | Neues Qt-freies **`runtime_target_telemetry.py`** liefert Quelle, Zeit, Qualität, Fehlergrund. UI konsumiert Snapshots; geschätzte AMD-„iVRAM“-Zahlen werden nicht als Admissionwert verwendet. |
 | Admission | nicht zentral vorhanden | Neues **`runtime_resource_manager.py`** ist alleiniger Besitzer von globalem Lock, Ledger, Reservations, Leases, Reconciliation und Poolindex. |
 | Queue/Fairness | `job_spooler.py` besitzt Jobs, aber keine globale Hardwarequeue | Neues **`resource_scheduler.py`** hält begrenzte Queue und Fairness. Es enthält keine Hardwaremessung. |
@@ -68,8 +76,9 @@ Das Diagramm ist eine Verantwortungszuordnung, keine Behauptung bereits vorhande
 
 | Ressourcenraum | Primärquelle | Ergänzung/Fallback | Fail-closed-Entscheidung |
 |---|---|---|---|
-| NVIDIA CUDA0 | NVML mit UUID/PCI-/Namevalidierung | DXGI-Budget plus validierte globale Nutzungsquelle; LUID-Zuordnung allein reicht nicht | Fehlen NVML und passende DXGI-Daten: `UNKNOWN`; keine zusätzliche automatische CUDA-Admission. |
-| AMD Vulkan0 | DXGI `QueryVideoMemoryInfo` für LOCAL und NON_LOCAL/shared, nach LUID | keine Port-/Fixwertheuristik | Fehlen validierte Budget- und globale Nutzungsdaten: `UNKNOWN`; AMD-Start nur nach begrenzter manueller Kalibrierungsfreigabe. |
+| NVIDIA CUDA0/Vulkan1 | NVML mit UUID/PCI-/Namevalidierung plus DXGI-Budget und Nutzung für den Adapter | Runtime-Gerät über PCI/LUID validieren; der Nutzer meldet keine angeschlossenen Monitore und bevorzugte Compute-Nutzung | NVIDIA bevorzugen, aber nur innerhalb des aktuellen effektiven Budgets abzüglich verifizierter Fremdnutzung und Treiberreserve; fehlende globale Nutzung ist `UNKNOWN`, keine freie Kapazität. |
+| AMD Vulkan0 (Display-iGPU) | DXGI `QueryVideoMemoryInfo` für LOCAL und NON_LOCAL/shared, nach Adapter-LUID | Laufzeitzuordnung aktiver Ausgänge via `QueryDisplayConfig`/DXGI; Nutzerangabe: 4 GiB zugewiesen, typischerweise etwa 300 MiB Displaylast | Die 300 MiB sind kein fester Abzug und 3,7 GiB keine Garantie. Compute nur innerhalb des aktuellen OS-/Vulkan-Budgets mit dynamischer Desktopreserve; AMD-Backing einmal gegen Host-Commit zählen. |
+| Monitor-zu-Adapter-Zuordnung | Windows `QueryDisplayConfig` beziehungsweise DXGI-Ausgänge, auf Adapter-LUID abgebildet | Nutzerangabe ist bis zu dieser Laufzeitprüfung eine Konfigurationsannahme | Bei fehlender/veralteter Zuordnung die Displayrolle nicht als gemessen behandeln und keinen Headroom-freien GPU-Pfad zulassen. |
 | Host-RAM/Commit | `GlobalMemoryStatusEx` plus `GetPerformanceInfo` | `psutil` nur UI-/`DEGRADED`-Fallback | Ohne Commitdaten keine commit-sensitive neue Host-/AMD-Admission. [4] [5] |
 | Prozess/Runtime | Registry, PID, lokaler Adapter | keine Ableitung aus Netzwerkfehler | Lebende PID hält Reservation bis eindeutige Reconciliation. |
 
@@ -99,8 +108,11 @@ nvidia_global_used + sum(unobserved_nvidia_delta_by_reservation)
 amd_external_shared_estimate + sum(own_amd_shared_peak_reservations)
   + candidate.amd_shared_peak + amd_shared_guard <= amd_effective_shared_budget
 
-sum(runtime_threads_including_candidate) <= cpu_thread_budget  # 8
-sum(runtime_threads_including_candidate) + ui_service_thread_reserve <= 12
+cpu_thread_budget_now = conservative_cpu_budget(current_cpu_load,
+    available_physical_mib, commit_headroom_mib, online_logical_threads)
+sum(runtime_threads_including_candidate) <= cpu_thread_budget_now
+sum(runtime_threads_including_candidate) + ui_service_thread_reserve_now <= online_logical_threads
+# Hohe CPU-Last oder RAM-/Commitdruck senkt das Budget; unbekannte Telemetrie => DEFER_TELEMETRY.
 ```
 
 **Keine zweite Zählung bereits sichtbarer Allokationen.** Der aktuelle Windows-Commit enthält die schon geladenen Prozesse. Deshalb wird nicht nochmals deren gesamter Peak addiert, sondern je Reservation nur der nicht beobachtete Rest: `max(0, reserved_peak - verified_observed_usage)`. Bei neuen Starts ist der Rest zunächst der volle Claim. Ohne verlässliche Prozesszuordnung darf ein Claim nicht als beobachtet ausgebucht werden; die konservative Überdeckung wird als solche ausgewiesen. Available Physical enthält die laufende OS-/UI-Last bereits; die 6-GiB-Reserve ist zusätzliche Headroompolicy, kein zweiter gemessener OS-Abzug. Commit und Resident Working Set sind getrennte Metriken. Hostplanung enthält AMD-Backing genau einmal; die AMD-Zeile ist ausschließlich die zusätzliche GPU-Budgetprüfung.
@@ -115,11 +127,11 @@ Diese Werte sind **Policyannahmen**, nicht gemessene Nutzungswerte oder Garantie
 
 | Parameter | Startwert | Zweck |
 |---|---:|---|
-| `cpu_thread_budget` / `ui_service_thread_reserve` | 8 / 4 | Auf 12 logischen Threads bleiben UI, Treiber und I/O handlungsfähig. |
+| `cpu_thread_budget_now` / `ui_service_thread_reserve_now` | dynamisch; kein fester 8-Thread-Startwert | Aus aktueller CPU-Last, logischen Threads, freiem physischem RAM und Commit-Headroom ableiten; hohe Last/RAM-Druck senkt das Budget. |
 | `os_ui_available_guard_mib` | 6144 | Schutzraum gegen Windows-/IDE-/Browserlast. |
 | `commit_safety_margin_mib` / `min_available_physical_mib` | 4096 / 4096 | Schutz gegen Commit- und physische Speicherknappheit. |
-| `nvidia_guard_mib` | 1024 | Zusätzliche WDDM-Schutzreserve auf 4-GiB-GPU. |
-| `amd_shared_guard_mib` | 2048 | Gegen DXGI-Shared-Budget, nicht doppelt gegen Host-Commit. |
+| `nvidia_guard_mib` | mindestens 1024 MiB, zusätzlich dynamischer WDDM-/Treiber-/Fremdprozess-Headroom | Provisorische Policy-Untergrenze, kein Messwert; NVIDIA bevorzugt nutzen, aber nicht bis zum OOM ausreizen. |
+| `amd_shared_guard_mib` | mindestens 2048 MiB als vorläufige Policy, plus dynamische Displayreserve | Gegen aktuelles DXGI-/Vulkan-Shared-Budget; AMD-Backing nicht doppelt gegen Host-Commit zählen. 300 MiB durchschnittliche Displaylast ist keine feste Budgetfreigabe. |
 | `max_queue` / `max_queue_per_role` | 32 / 8 | Begrenzter Stau statt unbounded RAM-Queue. |
 | Snapshot-/Telemetry-/Health-TTL | 2 s / 1 s / 2 s | Keine Admission auf alten Messwerten. |
 | Load-/Busy-/Idle-Lease | 45 s / 5 s / 300 s | Steuerbare Ladevorgänge, Heartbeats und Pool-Lebensdauer. |

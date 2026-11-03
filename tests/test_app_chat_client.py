@@ -7,7 +7,12 @@ from urllib.error import HTTPError
 import pytest
 
 import dbzscc.app.chat_client as chat_client_module
-from dbzscc.app.chat_client import ChatMessage, ChatProviderError, OpenAICompatibleClient
+from dbzscc.app.chat_client import (
+    ChatMessage,
+    ChatProviderError,
+    OpenAICompatibleClient,
+    is_loopback_endpoint,
+)
 
 
 class _Response:
@@ -87,6 +92,146 @@ def test_rejects_credentials_and_unsupported_endpoint_parts() -> None:
         OpenAICompatibleClient("https://example.com/v1?token=secret")
     with pytest.raises(ValueError):
         OpenAICompatibleClient("file:///tmp/model")
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        ("http://127.0.0.1:8080/v1", True),
+        ("http://[::1]:8080/v1", True),
+        ("http://localhost:8080/v1", True),
+        ("http://example.invalid/v1", False),
+        ("http://localhost.attacker.invalid/v1", False),
+        ("http://127.0.0.1.attacker.invalid/v1", False),
+        ("http://0.0.0.0:8080/v1", False),
+        ("file:///tmp/model", False),
+    ],
+)
+def test_loopback_endpoint_allowlist(endpoint: str, expected: bool) -> None:
+    assert is_loopback_endpoint(endpoint) is expected
+
+
+def test_local_only_stream_rejects_remote_endpoint_before_opening(monkeypatch) -> None:
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("a remote context request must not open a connection")
+
+    monkeypatch.setattr(chat_client_module, "urlopen", forbidden)
+    monkeypatch.setattr(chat_client_module, "build_opener", forbidden)
+
+    with pytest.raises(ChatProviderError, match="Loopbackserver"):
+        OpenAICompatibleClient("https://example.invalid/v1").stream_complete(
+            "model",
+            (ChatMessage("user", "question plus private files"),),
+            lambda _text: None,
+            threading.Event(),
+            local_only=True,
+        )
+
+
+def test_local_only_stream_disables_proxies_and_redirects(monkeypatch) -> None:
+    captured = {}
+    chunks = _stream_bytes(
+        'data: {"choices":[{"delta":{"content":"lokal"}}]}\n\n',
+        "data: [DONE]\n\n",
+    )
+
+    class FakeOpener:
+        def __init__(self, handlers):
+            self.handlers = handlers
+
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            return _ChunkedStreamResponse(chunks)
+
+    def fake_build_opener(*handlers):
+        captured["handlers"] = handlers
+        return FakeOpener(handlers)
+
+    def forbidden_urlopen(*_args, **_kwargs):
+        raise AssertionError("local-only requests must use the no-proxy opener")
+
+    monkeypatch.setattr(chat_client_module, "build_opener", fake_build_opener)
+    monkeypatch.setattr(chat_client_module, "urlopen", forbidden_urlopen)
+
+    answer = OpenAICompatibleClient("http://127.0.0.1:8080/v1").stream_complete(
+        "local-model",
+        (ChatMessage("user", "question plus private files"),),
+        lambda _text: None,
+        threading.Event(),
+        local_only=True,
+    )
+
+    assert answer == "lokal"
+    assert captured["url"] == "http://127.0.0.1:8080/v1/chat/completions"
+    assert captured["timeout"] == 90.0
+    proxy_handlers = [
+        handler
+        for handler in captured["handlers"]
+        if isinstance(handler, chat_client_module.ProxyHandler)
+    ]
+    assert len(proxy_handlers) == 1
+    assert proxy_handlers[0].proxies == {}
+    assert any(
+        isinstance(handler, chat_client_module._NoRedirectHandler)
+        for handler in captured["handlers"]
+    )
+    assert chat_client_module._NoRedirectHandler().redirect_request(None, None, None, None) is None
+
+
+def test_local_completion_disables_proxies_and_redirects(monkeypatch) -> None:
+    captured = {}
+
+    class FakeOpener:
+        def __init__(self, handlers):
+            self.handlers = handlers
+
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            captured["body"] = json.loads(request.data)
+            return _Response(
+                json.dumps({"choices": [{"message": {"content": "  geplant  "}}]}).encode()
+            )
+
+    def fake_build_opener(*handlers):
+        captured["handlers"] = handlers
+        return FakeOpener(handlers)
+
+    def forbidden_urlopen(*_args, **_kwargs):
+        raise AssertionError("local-only requests must use the no-proxy opener")
+
+    monkeypatch.setattr(chat_client_module, "build_opener", fake_build_opener)
+    monkeypatch.setattr(chat_client_module, "urlopen", forbidden_urlopen)
+    client = OpenAICompatibleClient("http://127.0.0.1:8080/v1", timeout_seconds=12.5)
+
+    answer = client.complete_local("local-model", (ChatMessage("user", "Plan"),))
+
+    assert answer == "geplant"
+    assert captured["url"] == "http://127.0.0.1:8080/v1/chat/completions"
+    assert captured["timeout"] == 12.5
+    assert captured["body"]["stream"] is False
+    assert any(
+        isinstance(handler, chat_client_module.ProxyHandler) and handler.proxies == {}
+        for handler in captured["handlers"]
+    )
+    assert any(
+        isinstance(handler, chat_client_module._NoRedirectHandler)
+        for handler in captured["handlers"]
+    )
+
+
+def test_local_completion_rejects_remote_endpoint_before_opening(monkeypatch) -> None:
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("a remote workflow request must not open a connection")
+
+    monkeypatch.setattr(chat_client_module, "urlopen", forbidden)
+    monkeypatch.setattr(chat_client_module, "build_opener", forbidden)
+
+    with pytest.raises(ChatProviderError, match="Loopback-Endpunkt"):
+        OpenAICompatibleClient("https://example.invalid/v1").complete_local(
+            "model", (ChatMessage("user", "request"),)
+        )
 
 
 def test_provider_errors_do_not_expose_response_body_or_credentials(monkeypatch) -> None:

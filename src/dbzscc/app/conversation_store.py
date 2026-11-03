@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ class StoredMessage:
     role: str
     content: str
     created_at: str
+    metadata: tuple[tuple[str, str], ...] = ()
 
 
 class ConversationStore:
@@ -58,6 +60,13 @@ class ConversationStore:
                     ON messages(conversation_id, created_at, message_id);
                 """
             )
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(messages)")
+            }
+            if "metadata_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+                )
 
     def create_conversation(self, title: str = "Neue Unterhaltung") -> Conversation:
         now = _utc_now()
@@ -85,23 +94,46 @@ class ConversationStore:
     def list_messages(self, conversation_id: str) -> tuple[StoredMessage, ...]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT message_id, conversation_id, role, content, created_at "
+                "SELECT message_id, conversation_id, role, content, created_at, metadata_json "
                 "FROM messages WHERE conversation_id = ? "
                 "ORDER BY rowid",
                 (conversation_id,),
             ).fetchall()
-        return tuple(StoredMessage(*row) for row in rows)
+        messages = []
+        for row in rows:
+            try:
+                raw_metadata = json.loads(row[5])
+                metadata = tuple(
+                    (str(key), str(value))
+                    for key, value in raw_metadata.items()
+                    if isinstance(key, str) and isinstance(value, str)
+                ) if isinstance(raw_metadata, dict) else ()
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = ()
+            messages.append(StoredMessage(*row[:5], metadata))
+        return tuple(messages)
 
     def add_message(
-        self, conversation_id: str, role: str, content: str
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        *,
+        metadata: Mapping[str, str] | None = None,
     ) -> StoredMessage:
         if role not in {"user", "assistant"}:
             raise ValueError("Only user and assistant messages are persisted.")
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Message content must not be empty.")
+        safe_metadata = _clean_message_metadata(metadata)
         now = _utc_now()
         message = StoredMessage(
-            uuid.uuid4().hex, conversation_id, role, content, now
+            uuid.uuid4().hex,
+            conversation_id,
+            role,
+            content,
+            now,
+            tuple(sorted(safe_metadata.items())),
         )
         with self._connection() as connection, connection:
             exists = connection.execute(
@@ -111,13 +143,16 @@ class ConversationStore:
             if exists is None:
                 raise KeyError("Conversation does not exist.")
             connection.execute(
-                "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO messages ("
+                "message_id, conversation_id, role, content, created_at, metadata_json"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     message.message_id,
                     message.conversation_id,
                     message.role,
                     message.content,
                     message.created_at,
+                    json.dumps(safe_metadata, ensure_ascii=False, sort_keys=True),
                 ),
             )
             if role == "user":
@@ -150,3 +185,38 @@ def _utc_now() -> str:
 def _clean_title(value: str) -> str:
     title = " ".join(value.split())
     return title[:72] if title else "Neue Unterhaltung"
+
+
+_MESSAGE_METADATA_KEYS = frozenset(
+    {
+        "run_id",
+        "runtime_run_id",
+        "model",
+        "backend",
+        "port",
+        "target_id",
+        "target_name",
+        "resource_status",
+        "host_memory_mib",
+        "accelerator_memory_mib",
+        "cpu_threads",
+        "endpoint_binding",
+    }
+)
+
+
+def _clean_message_metadata(value: Mapping[str, str] | None) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError("Message metadata must be a mapping.")
+    if len(value) > len(_MESSAGE_METADATA_KEYS):
+        raise ValueError("Message metadata exceeds its bounded field limit.")
+    clean: dict[str, str] = {}
+    for key, item in value.items():
+        if key not in _MESSAGE_METADATA_KEYS:
+            raise ValueError("Unsupported message metadata key.")
+        if not isinstance(item, str) or len(item) > 256 or any(ord(char) < 32 for char in item):
+            raise ValueError("Message metadata values must be bounded plain text.")
+        clean[key] = item
+    return clean

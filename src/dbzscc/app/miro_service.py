@@ -6,7 +6,8 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from dbzscc.miro.discovery_pipeline import LocalDiscoveryResult, run_local_discovery
-from dbzscc.miro.local_inventory import RootInput
+from dbzscc.miro.gguf_metadata import GGUFMetadataReader
+from dbzscc.miro.local_inventory import LocalInventoryScanner, RootInput
 
 from .config import application_data_directory
 
@@ -25,6 +26,8 @@ class MiroApplicationService:
         *,
         model_roots: Iterable[RootInput],
         runtime_roots: Iterable[RootInput],
+        scanner: LocalInventoryScanner | None = None,
+        reader: GGUFMetadataReader | None = None,
     ) -> LocalDiscoveryResult:
         models = tuple(model_roots)
         runtimes = tuple(runtime_roots)
@@ -35,4 +38,6 @@ class MiroApplicationService:
             database_path=self.database_path,
             model_roots=models,
             runtime_roots=runtimes,
+            scanner=scanner,
+            reader=reader,
         )
