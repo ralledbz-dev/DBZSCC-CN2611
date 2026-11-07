@@ -2,17 +2,38 @@ from __future__ import annotations
 
 import json
 import threading
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import pytest
 
 import dbzscc.app.chat_client as chat_client_module
 from dbzscc.app.chat_client import (
+    CatalogChatModel,
     ChatMessage,
     ChatProviderError,
     OpenAICompatibleClient,
     is_loopback_endpoint,
 )
+from dbzscc.miro.model_registry import ModelCatalogEntry
+
+
+def _catalog_entry(*, current_observation_id: str = "observation-1") -> ModelCatalogEntry:
+    observation = SimpleNamespace(
+        observation_id="observation-1", status="metadata_read"
+    )
+    artifact = SimpleNamespace(
+        current_observation_id=current_observation_id, status="metadata_read"
+    )
+    return ModelCatalogEntry(
+        artifact=artifact,
+        model=None,
+        observation=observation,
+        selected_metadata=(),
+        capability_evidence_json="{}",
+        runtime_qualifications=(),
+        multimodal_pairings=(),
+    )
 
 
 class _Response:
@@ -66,6 +87,27 @@ def test_model_listing_and_chat_completion_use_openai_compatible_contract(monkey
         {"role": "assistant", "content": "Guten Tag"},
     ]
     assert calls[1]["body"]["stream"] is False
+
+
+def test_catalog_backed_chat_selection_is_sent_and_stale_records_are_rejected(monkeypatch) -> None:
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data)
+        return _Response(
+            json.dumps({"choices": [{"message": {"content": "Antwort"}}]}).encode()
+        )
+
+    monkeypatch.setattr(chat_client_module, "urlopen", fake_urlopen)
+    client = OpenAICompatibleClient("http://127.0.0.1:8080/v1")
+    selection = CatalogChatModel("local-model", _catalog_entry())
+
+    assert client.complete(selection, (ChatMessage("user", "Hallo"),)) == "Antwort"
+    assert captured["body"]["model"] == "local-model"
+    with pytest.raises(ValueError, match="current parsed ModelCatalogEntry"):
+        CatalogChatModel(
+            "local-model", _catalog_entry(current_observation_id="stale-observation")
+        )
 
 
 def test_credentials_are_not_sent_to_plain_http_remote_hosts(monkeypatch) -> None:
@@ -298,7 +340,7 @@ def test_stream_complete_uses_sse_contract_and_emits_fake_chunk_deltas(monkeypat
     deltas: list[str] = []
 
     answer = client.stream_complete(
-        "local-model",
+        CatalogChatModel("local-model", _catalog_entry()),
         (ChatMessage("user", "Hallo"),),
         deltas.append,
         threading.Event(),

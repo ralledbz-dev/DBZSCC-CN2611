@@ -13,6 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 
 from .capability_evidence import CapabilityProfile, extract_gguf_capability_evidence
 from .gguf_metadata import GGUFMetadataReader, GGUFParseResult
@@ -23,7 +24,13 @@ from .local_inventory import (
     RootInput,
     ScanIssue,
 )
-from .model_registry import ArtifactRecord, LocalModelRegistry, RegistrySyncResult
+from .model_registry import (
+    ArtifactRecord,
+    CatalogQuery,
+    LocalModelRegistry,
+    RegistrySyncResult,
+)
+from .resumable_inventory import ResumableLocalInventoryScanner
 
 
 @dataclass(frozen=True)
@@ -49,11 +56,14 @@ class LocalDiscoveryResult:
     regular_files_seen: int
     reparse_points_skipped: int
     access_denied_directories: int
+    complete: bool = True
+    continuation_token: str | None = None
+    multimodal_pairs: tuple[object, ...] = ()
 
     @property
     def has_partial_results(self) -> bool:
         """Whether any scan, parse, identity or evidence issue was observed."""
-        if self.scanner_issues:
+        if not self.complete or self.scanner_issues:
             return True
         for item in self.artifacts:
             if item.issues or item.registry_record is None:
@@ -76,18 +86,27 @@ class LocalDiscoveryResult:
 class _RecordingScanner:
     """Capture the exact inventory returned to the existing registry service."""
 
-    def __init__(self, scanner: LocalInventoryScanner) -> None:
+    def __init__(
+        self, scanner: LocalInventoryScanner, cancel_event: Event | None = None
+    ) -> None:
         self._scanner = scanner
+        self._cancel_event = cancel_event
         self.inventory: InventoryScan | None = None
 
     def scan(
         self,
         model_roots: Iterable[RootInput] = (),
         runtime_roots: Iterable[RootInput] = (),
+        *,
+        resume_token: str | None = None,
     ) -> InventoryScan:
+        options = {} if resume_token is None else {"resume_token": resume_token}
+        if self._cancel_event is not None and getattr(self._scanner, "supports_cancel", False):
+            options["cancel_event"] = self._cancel_event
         self.inventory = self._scanner.scan(
             model_roots=model_roots,
             runtime_roots=runtime_roots,
+            **options,
         )
         return self.inventory
 
@@ -113,6 +132,9 @@ def run_local_discovery(
     observed_at: datetime | None = None,
     scanner: LocalInventoryScanner | None = None,
     reader: GGUFMetadataReader | None = None,
+    resume_token: str | None = None,
+    run_id: str | None = None,
+    cancel_event: Event | None = None,
 ) -> LocalDiscoveryResult:
     """Scan explicit local roots, parse GGUF metadata and persist one registry pass.
 
@@ -126,7 +148,11 @@ def run_local_discovery(
     raised after its transaction rolls back. Runtime candidates are inventory
     records only; they are not opened or executed.
     """
-    recording_scanner = _RecordingScanner(scanner or LocalInventoryScanner())
+    model_root_values = _root_values(model_roots)
+    runtime_root_values = _root_values(runtime_roots)
+    recording_scanner = _RecordingScanner(
+        scanner or ResumableLocalInventoryScanner(), cancel_event
+    )
     recording_reader = _RecordingReader(reader or GGUFMetadataReader())
     registry = LocalModelRegistry(
         database_path,
@@ -134,9 +160,11 @@ def run_local_discovery(
         reader=recording_reader,  # type: ignore[arg-type]
     )
     sync_result = registry.synchronize(
-        model_roots=model_roots,
-        runtime_roots=runtime_roots,
+        model_roots=model_root_values,
+        runtime_roots=runtime_root_values,
         observed_at=observed_at,
+        resume_token=resume_token,
+        run_id=run_id,
     )
 
     inventory = recording_scanner.inventory
@@ -181,18 +209,44 @@ def run_local_discovery(
             )
         )
 
+    from .multimodal_pairing import pair_multimodal_catalog_entries
+
+    catalog_by_artifact = {
+        entry.artifact.artifact_id: entry
+        for root in model_root_values
+        for entry in registry.query_catalog(
+            CatalogQuery(
+                root=os.path.abspath(os.fspath(Path(root).expanduser())),
+                run_id=sync_result.run_id,
+            )
+        )
+    }
+    catalog_entries = tuple(catalog_by_artifact.values())
+    multimodal_pairs = pair_multimodal_catalog_entries(catalog_entries)
+    if multimodal_pairs:
+        registry.record_multimodal_pairings(multimodal_pairs)
+
     return LocalDiscoveryResult(
         registry_sync=sync_result,
         artifacts=tuple(discovered),
-        scanner_issues=inventory.issues,
-        directories_visited=inventory.directories_visited,
-        entries_seen=inventory.entries_seen,
-        regular_files_seen=inventory.regular_files_seen,
-        reparse_points_skipped=inventory.reparse_points_skipped,
-        access_denied_directories=inventory.access_denied_directories,
+        scanner_issues=sync_result.scanner_issues,
+        directories_visited=sync_result.directories_visited,
+        entries_seen=sync_result.entries_seen,
+        regular_files_seen=sync_result.regular_files_seen,
+        reparse_points_skipped=sync_result.reparse_points_skipped,
+        access_denied_directories=sync_result.access_denied_directories,
+        complete=sync_result.complete,
+        continuation_token=sync_result.continuation_token,
+        multimodal_pairs=multimodal_pairs,
     )
 
 
 def _path_key(path: str | os.PathLike[str]) -> str:
     normalized = os.path.abspath(os.fspath(Path(path).expanduser()))
     return os.path.normcase(normalized)
+
+
+def _root_values(roots: Iterable[RootInput] | RootInput) -> tuple[RootInput, ...]:
+    if isinstance(roots, (str, os.PathLike)):
+        return (roots,)
+    return tuple(roots)

@@ -3,6 +3,10 @@ from __future__ import annotations
 import io
 import socket
 import time
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
 
 from dbzscc.app import runtime_service
 from dbzscc.app.execution_events import ExecutionEventType
@@ -21,6 +25,7 @@ from dbzscc.app.runtime_service import (
     RuntimeWorkflowError,
     _parse_runtime_devices,
 )
+from dbzscc.miro.model_registry import ModelCatalogEntry
 
 
 class FakeProcess:
@@ -119,6 +124,35 @@ def _setup_runtime(tmp_path, monkeypatch, *, device_output="", gpu_devices=()):
     return controller, runner, events, model_root, model_path
 
 
+def _catalog_entry(model_path) -> ModelCatalogEntry:
+    snapshot = model_path.stat()
+    observation_id = "observation-1"
+    artifact = SimpleNamespace(
+        artifact_id="artifact-1",
+        path=str(model_path.absolute()),
+        status="metadata_read",
+        current_observation_id=observation_id,
+        file_size_bytes=snapshot.st_size,
+        file_modified_at_utc=datetime.fromtimestamp(
+            snapshot.st_mtime, timezone.utc
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    observation = SimpleNamespace(
+        observation_id=observation_id,
+        status="metadata_read",
+        metadata_prefix_sha256="prefix-sha256",
+    )
+    return ModelCatalogEntry(
+        artifact=artifact,
+        model=SimpleNamespace(model_id="miro-model-1"),
+        observation=observation,
+        selected_metadata=(),
+        capability_evidence_json="{}",
+        runtime_qualifications=(),
+        multimodal_pairings=(),
+    )
+
+
 def test_model_enumeration_is_explicit_shallow_and_gguf_only(tmp_path) -> None:
     root = tmp_path / "selected-models"
     root.mkdir()
@@ -161,6 +195,64 @@ def test_cpu_plan_uses_fresh_preflight_but_does_not_start_a_process(tmp_path, mo
     assert runner.start_calls == []
     assert any(event.event_type is ExecutionEventType.TOT_PLAN_SELECTED for event in events)
     assert any(event.event_type is ExecutionEventType.TOOL_RESULT for event in events)
+
+
+def test_runtime_resource_admission_receives_central_catalog_entry(tmp_path, monkeypatch) -> None:
+    controller, runner, _events, model_root, model_path = _setup_runtime(
+        tmp_path, monkeypatch, device_output="CPU backend available"
+    )
+    entry = _catalog_entry(model_path)
+    full_hash = "c" * 64
+    controller._catalog_lookup = lambda _path: entry
+    controller._full_hash_lookup = lambda _artifact_id, _observation_id: full_hash
+    original_orchestrator = controller._orchestrator
+    captured = {}
+
+    def recording_plan(request, snapshot, **kwargs):
+        captured["request"] = request
+        return original_orchestrator.plan(request, snapshot, **kwargs)
+
+    controller._orchestrator = SimpleNamespace(plan=recording_plan)
+    plan = controller.plan(
+        conversation_id="chat-catalog",
+        model_root=model_root,
+        model_path=model_path,
+        backend=Backend.CPU,
+        context_tokens=2048,
+        cpu_threads=4,
+        port=8090,
+    )
+
+    assert plan.admitted
+    assert captured["request"].model_catalog_entry is entry
+    assert plan.model_artifact_id == entry.artifact.artifact_id
+    assert plan.model_full_file_sha256 == full_hash
+    assert runner.start_calls == []
+
+
+def test_runtime_start_aborts_if_full_hash_changes_after_fresh_admission(
+    tmp_path, monkeypatch
+) -> None:
+    controller, runner, _events, model_root, model_path = _setup_runtime(
+        tmp_path, monkeypatch, device_output="CPU backend available"
+    )
+    controller._catalog_lookup = lambda _path: _catalog_entry(model_path)
+    hashes = iter(("d" * 64, "e" * 64))
+    controller._full_hash_lookup = lambda _artifact_id, _observation_id: next(hashes)
+
+    with pytest.raises(RuntimeWorkflowError, match="Hash änderte sich"):
+        controller.start(
+            conversation_id="chat-stale-hash",
+            model_root=model_root,
+            model_path=model_path,
+            backend=Backend.CPU,
+            context_tokens=2048,
+            cpu_threads=4,
+            port=8091,
+        )
+
+    assert runner.run_calls[0][1:] == ("--list-devices",)
+    assert runner.start_calls == []
 
 
 def test_vulkan_target_requires_unique_nvidia_memory_match(tmp_path, monkeypatch) -> None:

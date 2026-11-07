@@ -1,13 +1,40 @@
 # MIRO Model Registry — Gesamtplan und Implementierungsnachweis
 
-**Projekt:** DBZSCC2611 · **Stand:** 2. November 2026  
-**Status dieses Slices:** Capability-Evidenzextraktion implementiert und lokal getestet; keine GUI-/Runtime-Abnahme.
+**Projekt:** DBZSCC2611 · **Stand:** 3. November 2026
+**Aktueller Status:** Persistenter MIRO-Katalog und zentrale App-Consumer sind verdrahtet und regressionstestsicher. Der echte `D:\Models`-Scan ist gespeichert, wegen einer Zugriffsausnahme als Teilresultat markiert. Es wurde kein Modell gestartet; Runtime-Qualifikationen bleiben **0**. Kein Commit/Push.
 
 ## Kurzüberblick
 
-MIRO soll den lokalen Modellbestand nachvollziehbar erfassen, ohne Dateinamen mit Fähigkeiten oder Modellidentität zu verwechseln. Der bisherige Kern kann ausdrücklich angegebene Modell- und Runtime-Roots inventarisieren und begrenzte GGUF-v2/v3-Metadaten lesen. Auf der Registry baut jetzt eine kleine, reine Capability-Evidenzextraktion auf; sie hält technische und deklarierte Metadaten getrennt von echten Runtime-Tests.
+MIRO erfasst ausdrücklich ausgewählte lokale Modellbestände in einer zentralen, persistenten SQLite-Registry. UI-Listen/Picker, Chat, Workflowplanung, Ressourcen-Admission, Projektlauf und Development-Server verwenden jetzt typisierte `ModelCatalogEntry`-Daten statt jeweils unabhängiger Modellwahrheiten. Metadaten und Dateinamen bleiben von Fähigkeit, Laufzeit-Kompatibilität und Qualität getrennt.
 
-Der Stand ist bewusst enger als eine produktive Modellverwaltung: Die Registry liest vorhandene Metadaten, führt keine Modelle aus und lädt nichts herunter. Der SHA-256-Wert gilt nur für den vom GGUF-Reader gelesenen Metadatenpräfix, nicht für die vollständige Modell-Datei.
+Der echte Scan erfasste 6.005 Verzeichnisse und 53.392 Einträge: 260 GGUF-Kandidaten, 178 Nicht-GGUF-Kandidaten, 243 aufgelöste GGUF-Identitäten und 17 ungelöste. Es gab 0 Parserfehler und 1 verweigertes Verzeichnis (`D:\Models\ModelVault\Claude\.pytest_cache`); der Lauf wurde vollständig traversiert, bleibt aber korrekt `partial` und hat keinen Fortsetzungscursor.
+
+`metadata_prefix_sha256` ist ausschließlich der SHA-256 des gelesenen GGUF-Metadatenpräfixes. Ein vollständiger Datei-SHA-256 wird nicht bei jedem Scan gerechnet, sondern für explizit ausgewählte Modelle/Paare bei Bedarf gestreamt und vor einer Qualifikation erneut geprüft. Der Scan hat weder Runtime-Builds geprüft noch Modelle gestartet oder heruntergeladen.
+
+## Verbraucher-Matrix
+
+Die Registry ist die gemeinsame Quelle für Modellidentität und Beobachtungs-Provenienz. Verbraucher erhalten typisierte Katalogeinträge; ihre jeweils eigenen Aufgabenregeln bleiben davon getrennt.
+
+Der Producer-Pfad ist ebenfalls angebunden: Der App-Start-Hintergrundscan ist standardmäßig eingeschaltet, verwendet konfigurierte Roots und persistiert in dieselbe Registry, aus der die Verbraucher lesen.
+
+| Consumer | Zentrale Registry-Eingabe | Status und Testnachweis |
+|---|---|---|
+| MIRO-Liste/Detailzeile | Run-spezifisches `query_catalog(CatalogQuery(...))`; Tabelle zeigt Artefakt, Identität, Rollen, Pairings und Qualification-Status. | Angeschlossen; siehe `main_window.py` und `test_miro_app_service.py`. |
+| Runtime-Modellpicker | Rekursiver Katalog-Discovery-Output; UI übernimmt nur echte `ModelCatalogEntry`-Objekte mit aktueller, geparster GGUF-Observation. | Angeschlossen; Picker-Test prüft gespeicherten Katalogpfad. |
+| Chat | Eindeutige Zuordnung des ausgewählten Server-Modellnamens zu einem aktuellen Katalogrecord; `CatalogChatModel` trägt den Entry in den Streaming-Client. | Angeschlossen; Chat-Client- und UI-Streamingtests prüfen Typ, Beobachtung und gespeicherte Modell-IDs. |
+| LangChain-Workflowplanner | Der aktuelle `ModelCatalogEntry` geht in die echte Runnable-Kette; der Chat-Client erhält eine Registry-gebundene `CatalogChatModel`. Der Prompt erhält nur beschränkte Identitäts-/Provenienzfelder. | Angeschlossen; Test prüft, dass Client und Planner dasselbe Entry-Objekt erhalten. Keine Fähigkeitsinferenz aus Metadaten. |
+| Runtime-Preflight und Start | Der ausgewählte Pfad wird gegen aktuellen Katalogpfad, Observation und Snapshot geprüft; der ausgewählte GGUF wird on-demand voll gehasht und vor Prozessstart erneut gebunden. | Angeschlossen; Runtime-Test prüft typed ResourceRequest und Abbruch bei Hashänderung nach Admission. Kein echter Start in dieser Arbeit. |
+| ResourcePlanner/Admission | `WorkloadRequest.model_catalog_entry` ist ein validierter Evidence-Anhang. Größen-, Kontext-, Speicher- und Workload-Filter bleiben getrennte Planungsinputs und überschreiben keine Registry-Evidenz. | Angeschlossen; Runtime-Admission-Regression prüft den unveränderten typed Entry im Request. |
+| Projektlauf/Debug und Development-Server | Validierter Workflowplan und Ausführungs-/Serverplan führen denselben aktuellen `ModelCatalogEntry`; fehlende oder veraltete Records werden fail-closed zurückgewiesen. | Angeschlossen; ProjectExecution- und Devserver-Tests prüfen die Weitergabe. Jeder Prozessstart bleibt separat freigabegesteuert. |
+| Künftiger RAG-Consumer | Noch nicht implementiert. Ein späteres RAG muss Inhalte/Quellen getrennt halten und Modellidentität aus `CatalogQuery` beziehen. | Geplant; derzeit keine RAG-Registry-Anbindung behauptet. |
+
+## Hash-Integrität und Qualification-Gate
+
+Der Discovery-Hash bleibt klar als `metadata_prefix_sha256` beschriftet. Schema-Migration v5 ergänzt eine separate Tabelle für dateigroße, gestreamte SHA-256-Werte je Artefakt und Observation. Gehasht wird nur bei expliziter Auswahl eines Modells oder eines Paars; bestehende Inventurdateien werden nicht bei jedem Scan erneut vollständig gelesen. Ein geänderter Snapshot oder abweichender Vollhash bricht die Startfreigabe ab.
+
+Eine Runtime-Qualification ist nur mit aktuellem Vollhash des GGUF, exaktem llama.cpp-Build-SHA-256, Backend, physischer Geräte-ID, Einstellungen und Runtime-Parametern zulässig. Multimodale Qualification bindet zusätzlich den ausgewählten Projektor und dessen eigenen aktuellen Vollhash. Der Registry-Aggregator leitet `qualified` erst aus mindestens zwei separaten vollständigen, persistierten Antworten mit unterschiedlichen Lauf- und Message-IDs sowie identischer Hardware-/Build-/Hash-Bindung ab. Der Chat prüft die vollständige Antwort per SQLite-Read-back, bevor er diesen Beleg schreibt.
+
+Der vorhandene CPU-Qwen-Eintrag zählt nicht automatisch als aktueller Nachweis: Ohne belegte aktuelle Datei-, Build-, Geräte- und Parameterbindung bleibt er historische Information, keine Qualification.
 
 ## Übergreifender MIRO-Plan
 
@@ -17,9 +44,9 @@ Die folgende Reihenfolge fasst die im MIRO-Visionpapier beschlossenen Entwicklun
 2. **Begrenzte GGUF-Metadatenextraktion:** Little-Endian v2/v3-Präfix lesen, Limits erzwingen, Big-Endian ablehnen und Parserfehler strukturiert melden. Tensoren und Gewichte bleiben unangetastet. **Implementiert und mit synthetischen Dateien getestet.**
 3. **Model-/Artifact-Registry:** ausgewählte Metadaten normalisieren, Modellidentität von lokalen Artefakten trennen, Provenienz und Beobachtungen lokal in SQLite persistieren. **Dieser Slice ist implementiert und getestet.**
 4. **Capability- und Kompatibilitätsanalyse:** technische Merkmale, Template/Tokenizer und Runtime-Nachweise mit klaren Evidenzstufen verknüpfen. **Erster konservativer Metadaten-Slice implementiert und getestet; Modalitätsabnahme, Lizenzprüfung und Runtime-Nachweise bleiben offen.**
-5. **Hardware- und Ressourcenprofil:** tatsächliche Telemetrie, Speicherbudgets, Unsicherheit und konservative Admission nach dem vorhandenen Scheduling-Entwurf abbilden. **Geplant; keine Messung oder Admission wurde hier vorgenommen.**
+5. **Hardware- und Ressourcenprofil:** das bestehende ResourceOrchestrator-Admission nimmt nun den typisierten Katalogeintrag als Evidenz mit; Workload-Schätzung und Hardwarefilter bleiben separate Inputs. **Adapter implementiert und getestet; der echte Modellbestand wurde nicht gemessen/admitted.**
 6. **Benchmark-Labor und Modellprofile:** reproduzierbare Einzel-/Kombinationstests sowie versionierte, validierte Use-Case-Profile ergänzen. **Geplant; kein Benchmark oder Profil wurde ausgeführt.**
-7. **Runtime-, Cognitive- und UI-Integration:** Start/Lifecycle, Profile, Orchestrierung und UI erst hinter den getesteten Verträgen anbinden. **Geplant; dieser Slice verdrahtet nichts in die Anwendung.**
+7. **Runtime-, Workflow- und UI-Integration:** Picker, Chat, Planner, Runtime-Preflight, Projektlauf und Devserver greifen auf dieselbe Registry-Observation zu. **Adapter implementiert und getestet; kein echter Runtime-Start und keine reale Modellqualifikation. RAG bleibt geplant.**
 
 ## Was jetzt implementiert ist
 
@@ -32,6 +59,8 @@ Die Auswahl der zusätzlich persistierten Rohmetadaten ist bewusst eng: `general
 ## SQLite-Vertrag und Evidenz
 
 Das lokale Schema beginnt mit `schema_migrations` (Version 1) sowie den Tabellen `models`, `artifacts` und `artifact_observations`. Die Migrationen sind versioniert; eine unbekannte neuere Version wird fail-closed abgelehnt. Die Registry ist ausschließlich MIRO-Modell-/Artefaktzustand und übernimmt keine Projekt-, Workspace-, Task- oder UI-Daten.
+
+Schema-Migration v5 ergänzt die optionale Vollhash-Tabelle additiv. Die bestehende lokale App-Datenbank und ihr realer Scan wurden in diesem Implementierungsschritt nicht geöffnet, migriert, neu gescannt oder überschrieben; der bestehende Datenbestand bleibt erhalten. Die Migration läuft beim nächsten normalen Öffnen der Registry.
 
 Drei Identitäten bleiben getrennt:
 
@@ -63,7 +92,7 @@ Der Aufrufer entscheidet über den Datenbankpfad und die zu scannenden Roots. Di
 
 Jeder Wert trägt eine Evidenzklasse (`technical_metadata` oder `declared_metadata`), den ursprünglichen Metadatenschlüssel und den Datei-Offset. Falsche Typen oder nichtpositive Architekturwerte werden als Extraktionsprobleme zurückgegeben, nicht als Eigenschaften. Modellname und Dateiname erzeugen keine Fähigkeitssignale. Insbesondere folgt aus Kontextmetadaten keine tatsächlich konfigurierte Runtime-Kontextgröße und aus einem Chat-Template weder Tool-Calling-Kompetenz noch Antwortqualität oder Coding-/Reasoning-Qualität.
 
-Der Profilstatus ist ausdrücklich `runtime_test_status="not_tested"` mit leerer Liste `runtime_tested_capabilities`. `multimodal_status` bleibt `not_verified`; ein GGUF-Metadatenhinweis genügt nicht. Eine künftige multimodale Verifikation muss das passende Modell-/Projektor-Paar gemeinsam verwenden und einen Bild-Ende-zu-Ende-Test bestehen. Dieser Slice erkennt oder paart keine Projektoren, startet keine Runtime, lädt nichts herunter, ändert keine SQLite-Migration und verdrahtet weder UI noch Runtime.
+Der Profilstatus ist ausdrücklich `runtime_test_status="not_tested"` mit leerer Liste `runtime_tested_capabilities`. `multimodal_status` bleibt `not_verified`; ein GGUF-Metadatenhinweis genügt nicht. Die separate Pairing-Komponente kann Kandidaten speichern, aber erst ein gemeinsamer Bild-Ende-zu-Ende-Test darf multimodale Nutzung bestätigen. Dieser Metadaten-Evidenzextraktor selbst führt weder Projektor- noch Runtime-Tests aus.
 
 ## Zusammengesetzter Ein-Pass-Discovery-Ablauf
 
@@ -71,7 +100,7 @@ Der Profilstatus ist ausdrücklich `runtime_test_status="not_tested"` mit leerer
 
 Das Rückgabeobjekt trennt je Kandidat den `LocalArtifact`, den aktuellen `ArtifactRecord`, das exakte `GGUFParseResult` und – falls zulässig – das `CapabilityProfile`. Runtime-Kandidaten haben kein Parsergebnis und werden nicht geöffnet oder ausgeführt. Parserfehler bleiben zusammen mit ihren strukturierten Issues sichtbar; Scannerprobleme und erfolgreiche Teilergebnisse laufen weiter. Ein Profil wird nur bei erfolgreichem Parsing und Registry-Status `metadata_read` erzeugt. Bei `artifact_changed_during_scan` bleiben die gelesenen Metadaten als Parsebeleg erkennbar, aber Identität und Capability-Hinweise werden unterdrückt. `has_partial_results` markiert Scan-/Parse-/Identitäts-/Evidenzprobleme; SQLite-Fehler propagieren unverändert und führen zum Rollback.
 
-Nur der vom Aufrufer explizit angegebene persistente SQLite-Pfad wird beschrieben. Es gibt keine impliziten Roots, Schemaänderung, Netzsuche, Downloads, Runtime-Starts, Hardwareprüfung oder UI-Integration. Die Ausgabe folgt der stabil sortierten Inventur; ein vom Aufrufer gesetztes `observed_at` macht Zeitstempel reproduzierbar, während `run_id` absichtlich je Synchronisation neu ist. Die Entscheidung stützt sich ausschließlich auf die bereits dokumentierten lokalen Projektverträge und die bestehenden vier MIRO-Services; in diesem Schritt wurden keine zusätzlichen externen Quellen oder alten Codevorlagen verwendet.
+Der Ein-Pass-Discovery-Ablauf bleibt auf den vom Aufrufer explizit angegebenen persistenten SQLite-Pfad und Roots beschränkt; er selbst lädt nichts herunter, führt keine Modelle aus und misst keine Hardware. Die spätere Consumer-Integration ist in der Matrix oben getrennt belegt. Die Ausgabe folgt der stabil sortierten Inventur; ein vom Aufrufer gesetztes `observed_at` macht Zeitstempel reproduzierbar, während `run_id` je Synchronisation neu ist.
 
 ## Verwendete Projektunterlagen und Quellen
 
@@ -101,22 +130,42 @@ Die konzeptionellen und technischen 2410-Materialien wurden nicht als Quellcode 
 - `doc/MIRO_LOCAL_DISCOVERY.md` — aktuelle Funktionsgrenzen, Status und Link auf dieses Dokument.
 - `doc/MIRO_MODEL_REGISTRY_PLAN_AND_EVIDENCE.md` — dieser neue Plan-/Quellen-/Evidenznachweis.
 
-Es wurden keine Commits, Pushes oder Merges erstellt. Die vorhandenen MIRO-Zieldateien wurden punktuell erweitert; nicht betroffene untracked Projektdateien wurden weder bereinigt noch überschrieben.
+### Consumer-Integration und Regressionen
+
+- Services/UI: `src/dbzscc/app/miro_service.py`, `chat_client.py`, `conversation_store.py`, `workflow_runtime.py`, `resource_orchestrator.py`, `runtime_service.py`, `project_execution.py`, `development_server.py` und `src/dbzscc/ui/main_window.py`.
+- Tests: `test_registry_catalog.py`, `test_catalog_pairing.py`, `test_runtime_service.py`, `test_app_chat_client.py`, `test_workflow_runtime.py`, `test_project_execution.py`, `test_development_server.py`, `test_conversation_store.py`, `test_miro_app_service.py` und `test_ui_smoke.py`.
+- Schema-/Hash-Änderungen sind additiv; die echte lokale App-Datenbank und der bereits gespeicherte Scan wurden in diesem Schritt nicht geöffnet, migriert, neu gescannt oder überschrieben. Beim nächsten normalen Öffnen der Registry greift Migration v5.
+
+Es wurden keine Commits, Pushes oder Merges erstellt. Es wurden keine Modelle heruntergeladen und kein Runtime-Prozess gestartet.
 
 ## Tatsächliche Testevidenz und offene Grenzen
 
 Ausgeführt auf RAZOR unter Windows im Checkout `D:\Dev\DBZSCC2611` mit Python 3.15.2 und Ruff 0.17.3:
 
-- `python -m pytest -p no:cacheprovider -q` → **31 passed**, Exitcode **0**.
+- `python -m pytest -p no:cacheprovider -q -rs` → **254 passed, 0 skipped**, Exitcode **0**.
+- Fokussierte Consumer-Regressionen → **105 passed**, Exitcode **0**.
 - `ruff check src/dbzscc tests` → **All checks passed**, Exitcode **0**.
 
-Die Tests nutzen synthetische GGUF-Dateien. Nicht ausgeführt wurden ein Scan echter Modellordner, ein echter Modell-/Voll-Datei-Hash, Tensor- oder Gewichtsprüfung, llama.cpp-Inferenz, Hardware-/GPU-Messung, Kompatibilitäts- oder Capability-Abnahme sowie GUI-/App-Integration. Der Checkout meldete `master` ohne vorhandenen Commit; alle Projektdateien waren untracked. Deshalb kann dieses Testergebnis nicht an einen Commit-SHA gebunden werden.
+Unter Python 3.15.2 meldete der Workflow-Test 176 `DeprecationWarning`s aus LangChain (`asyncio.iscoroutinefunction`); sie sind nicht fehlgeschlagen und es gab keine Skips. Ruff 0.17.3 war sauber.
+
+Der reale Scan von `D:\Models` ist aus dem vorherigen Schritt persistent vorhanden; dieser Durchlauf hat ihn nicht erneut ausgeführt. Es wurde kein On-demand-Vollhash auf dem echten Bestand gerechnet, kein Runtime-Binary geprüft oder gestartet, keine Hardware-/GPU-Messung vorgenommen und keine Multimodalität qualifiziert. Der unveränderte Prefix-Hash ist kein Ersatz für Voll-Datei-Hashes.
 
 ## Nächster sinnvoller Schritt
 
-Als Nächstes ist eine separate multimodale Verifikation sinnvoll: passendes Modell-/Projektor-Paar gemeinsam prüfen und einen Bild-Ende-zu-Ende-Test dokumentieren. Bis dahin bleibt die multimodale Nutzung unverifiziert; Runtime- und Hardwareaussagen benötigen weiterhin separat ausgeführte, konkret dokumentierte Prüfungen.
+Als nächstes müssten Runtime-Roots ausdrücklich konfiguriert, ein klar unterstütztes und sicheres Modell-/Projektor-Paar ausgewählt und nach frischer Ressourcen-Admission geprüft werden. Erst nach Vollhash-Prüfung beider Dateien, exakter Build-/Backend-/Geräte-/Parameterbindung und zwei vollständigen, separat gespeicherten Antworten darf daraus eine Qualification entstehen. Bis dahin sind die zwei vorhandenen Bild-Paar-Kandidaten `not_tested`; RAG bleibt nicht implementiert.
 
 
-## Nächster Schritt nach diesem Capability-Slice
+## Tatsächliche lokale E2E-Prüfung auf RAZOR (3. November 2026)
 
-Der oben dokumentierte Capability-Metadaten-Slice ist jetzt umgesetzt und getestet. Ein späterer, separater multimodaler Nachweis müsste ein passendes Modell-/Projektor-Paar gemeinsam prüfen und einen Bild-Ende-zu-Ende-Test bestehen; bis dahin bleibt `multimodal_status="not_verified"`. Das wurde in diesem Auftrag nicht ausgeführt.
+Der echte Modelllauf mit `Qwen2.5-0.5B-Instruct` wurde **nicht** gestartet. Die Registry im normalen Benutzerprofil war aus dem aktuellen Ausführungskontext wegen fehlenden Zugriffs nicht lesbar; damit ließ sich weder die aktuelle Auswahl noch die fortbestehende Existenz dieses Modells verlässlich bestätigen. Entsprechend wurden kein app-eigener llama.cpp-Prozess gestartet, kein `/health` abgefragt und keine vollständigen Modellantworten erzeugt. Es wurden kein GGUF-Vollhash, kein Runtime-Build-Hash und keine neue Runtime-Evidenz in eine Registry geschrieben. Insbesondere wurden die Zustände `runtime_tested` und `qualified` nicht verändert oder gleichgesetzt; eine zusätzliche Datenbank wurde nicht angelegt.
+
+Für den isolierten Run/Test/Fix-Test blockierte Windows den zuvor vorgesehenen Loopback-HTTP-Testtransport mit `WinError 10013`. Es wurde kein Socketzugriff weiter versucht: Nur der Transport des deterministischen Vorschlags wurde durch einen In-Memory-Testdouble ersetzt. Der Produktionsaufruf `OpenAICompatibleClient.complete`, der strukturierte Vorschlagsparser, `ProjectExecutionService`, `apply_reviewed_proposal` und der automatische pytest-Retest liefen; es fand **keine** Modellinferenz statt. Das Ergebnis ist deshalb ausdrücklich ein deterministischer Fixture-Test und kein modellgestützter Patch-Nachweis.
+
+Im neu angelegten `.tmp/cue-e2e-run-test-fix-20261103-233200/fixture` bestand das reale, app-eigene pytest-Startverfahren seine frische Ressourcen-Admission. Ein einzelner stabiler `run_id` (`b17e5eac874149e49d145f07f9f070da`) blieb über vier Vorschlags-/sichtbare-Diff-/Apply-/Retest-Zyklen erhalten. Jeder Patch war an die vorab erfasste Datei gebunden und durfte ausschließlich `tests/target.py` ändern; nach jedem atomaren Apply wurde der Projekt-Fingerprint aktualisiert und für den Retest neu gebunden. Die Retests 1–3 endeten erwartungsgemäß mit Exitcode 1; Iteration 4 bestand mit Exitcode 0 (`1 passed in 0.01s`). stdout, stderr und separate Exitcode-Events wurden erfasst; es gingen keine Ausgabelinien verloren. Damit wurde die Schleife tatsächlich über drei Iterationen hinaus geprüft, ohne eine gewöhnliche feste Dreiergrenze.
+
+Ein separater abbrechbarer Fixture-Test startete und meldete `CANCEL_FIXTURE_STARTED`; die Cancellation wurde nach etwa 2,13 Sekunden als `cancelled` zurückgegeben (Prozess-Exitcode 1). Nach jedem Retest und nach diesem Abbruch meldete der Projektservice keinen aktiven app-eigenen Prozess mehr. Zusätzlich wurde `MainWindow._repair_failure_signature` mit realer, redigierter Fehlerausgabe auf Gleichheit nach Whitespace-Normalisierung geprüft. Ein künstlicher No-Progress-Zyklus mit absichtlich falschem Patch wurde nicht erzwungen, um keinen wissentlich schlechten Patch anzuwenden.
+
+Die Fixture-Ausgabe und die vier sichtbaren Diff-Dateien liegen für die Nachprüfung im genannten `.tmp`-Arbeitsverzeichnis. Originale Projektquellen, echte Projekttests, Runtime-Binaries und Registry-Daten wurden für diesen Fixture-Lauf nicht geändert; es gab keinen Commit oder Push. Die zuvor gemeldete vollständige Suite mit 263 bestandenen Tests und sauberem Ruff-Lauf wurde in dieser konkreten E2E-Prüfung nicht erneut ausgeführt.
+
+
+Der Fixture-Nachweis lief kopflos über die Produktionsservices und korrelierte Run-ID, Fingerprints und Ereignisse; eine interaktive MainWindow-/Qt-Signalsequenz oder echte Chat-UI-Bedienung wurde nicht ausgeführt. Die sichtbaren Diff-Dateien wurden im `.tmp`-Arbeitsverzeichnis abgelegt, nicht in einer UI angezeigt.

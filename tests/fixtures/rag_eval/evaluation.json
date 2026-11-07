@@ -1,0 +1,169 @@
+{
+  "suite_id": "dbzscc2611-offline-rag-synthetic-v1",
+  "documents": [
+    {
+      "path": "docs/de/atomarer-neuaufbau.md",
+      "language": "de",
+      "role": "relevant",
+      "content": "# Atomarer Neuaufbau\n\nEin neuer RAG-Index wird zuerst als getrennte Generation aufgebaut. Vor der Aktivierung vergleicht der Builder die gespeicherte Chunkzahl mit den erwarteten Chunks und kontrolliert zusätzlich die FTS5-Zeilen. Erst nach beiden Konsistenzprüfungen wird der aktive Generationszeiger in derselben Datenbanktransaktion umgeschaltet. Scheitert der Neuaufbau vorher, bleibt die alte Generation aktiv und vollständig lesbar."
+    },
+    {
+      "path": "docs/de/e5-vertrag.md",
+      "language": "de",
+      "role": "relevant",
+      "content": "# E5-Vektorvertrag\n\nFür eine Suchanfrage verwendet der lokale Encoder exakt das Präfix `query: `; gespeicherte Textabschnitte erhalten `passage: `. Das ONNX-Modell bildet einen maskierten Mittelwert der Tokenzustände und normalisiert den resultierenden 384-dimensionalen Vektor mit L2. Beide Seiten müssen dieselbe gepinnte Modell-, Tokenizer- und Laufzeit-Fingerprint verwenden."
+    },
+    {
+      "path": "docs/de/ausschlussregeln.md",
+      "language": "de",
+      "role": "relevant",
+      "content": "# Ausschlussregeln des Workspace-Scans\n\nDer Scanner nimmt nur erlaubte Textformate auf. Versteckte Pfade, `.git`, virtuelle Umgebungen, Build- und Cache-Verzeichnisse, Credential-Dateinamen, Reparse-Points, Nicht-UTF-8-Dateien und Inhalte mit erkannten Geheimnismustern werden ausgeschlossen. Ausgeschlossene Inhalte werden weder gehasht noch indexiert oder protokolliert."
+    },
+    {
+      "path": "docs/de/einmaliger-chat-kontext.md",
+      "language": "de",
+      "role": "relevant",
+      "content": "# Einmaliger Chat-Kontext\n\nAbgerufene lokale RAG-Ausschnitte sind standardmäßig deaktiviert. Der Nutzer bestätigt Projekt und Endpunkt ausdrücklich, bevor die nächste einzelne Chat-Nachricht den Kontext verwenden darf. Danach wird die Freigabe verbraucht; Folgefragen erhalten nicht automatisch erneut Projekttexte. Ausschnitte werden nicht im App-Chatverlauf gespeichert."
+    },
+    {
+      "path": "docs/de/projekt-isolation.md",
+      "language": "de",
+      "role": "relevant",
+      "content": "# Projektgebundener Index\n\nJede Suche benötigt die ID des ausdrücklich ausgewählten Projekts. Aktive Generationen, Chunks und FTS5-Einträge werden mit dieser Projekt-ID getrennt gespeichert und die Abfrage darf nur die aktive Generation genau dieser ID lesen. Der Datenbankpfad allein ist keine Berechtigung, fremde Projektinhalte einzumischen."
+    },
+    {
+      "path": "docs/de/offline-cpu.md",
+      "language": "de",
+      "role": "relevant",
+      "content": "# Offline-CPU-Laufzeit\n\nEmbeddings laufen lokal mit ONNX Runtime und ausschließlich `CPUExecutionProvider`. Vor Inferenz prüft das Programm die lokalen ONNX- und Tokenizer-Hashes gegen ein Manifest. Fehlen Modell oder CPU-Provider, bricht der Auftrag geschlossen ab: es gibt weder Netzwerkzugriff noch Cloud-, GPU- oder heuristisches Retrieval-Fallback."
+    },
+    {
+      "path": "docs/de/ui-fortschritt.md",
+      "language": "de",
+      "role": "distractor",
+      "content": "# UI-Fortschritt\n\nDie Desktop-Oberfläche zeigt den Zustand laufender lokaler Arbeiten mit einer Statusmeldung an. Meldungen sollen kurz und verständlich sein; sie ändern weder Projektdateien noch Modellprofile. Ein Fenster darf während eines langen Vorgangs neu gezeichnet werden."
+    },
+    {
+      "path": "docs/de-sicherung.md",
+      "language": "de",
+      "role": "distractor",
+      "content": "# Sicherung lokaler Einstellungen\n\nBenutzereinstellungen können exportiert und später wieder importiert werden. Ein Export enthält Anzeigeoptionen und zuletzt gewählte Oberflächenbereiche, aber keine Zugangsdaten und keine Inhalte lokaler Projekte."
+    },
+    {
+      "path": "docs/en/lexical-ranking.md",
+      "language": "en",
+      "role": "relevant",
+      "content": "# Lexical candidate ranking\n\nThe local index uses SQLite FTS5 with its BM25 ranking as an independent lexical candidate list. It does not rescale BM25 into an embedding score. Lexical ranks are combined with the separately ranked dense candidates by reciprocal rank fusion, so exact terms can help without pretending both score types share a scale."
+    },
+    {
+      "path": "docs/en/result-bound.md",
+      "language": "en",
+      "role": "relevant",
+      "content": "# Bounded result count\n\nOne local search returns at most five snippets through the application worker. The limit is fixed at the worker boundary even though the lower-level index supports a larger internal limit. The application does not silently request extra pages or switch to another retrieval service when fewer matches are found."
+    },
+    {
+      "path": "docs/en/worker-boundary.md",
+      "language": "en",
+      "role": "relevant",
+      "content": "# Fixed worker boundary\n\nThe application starts one repository-pinned Python interpreter with isolated mode and a fixed worker script. It sends one bounded JSON request on standard input, disables shell interpretation, and accepts only the worker's fixed response schema. Request text is never converted to a command, module name, or executable path."
+    },
+    {
+      "path": "docs/en/source-locations.md",
+      "language": "en",
+      "role": "relevant",
+      "content": "# Source locations in retrieved context\n\nEach returned excerpt carries a canonical project-relative path, a symbol or section label, and inclusive start and end line numbers. The chat can cite where an excerpt came from without exposing an absolute workspace root in the result."
+    },
+    {
+      "path": "docs/en/manifest-verification.md",
+      "language": "en",
+      "role": "relevant",
+      "content": "# Offline model integrity\n\nThe local manifest pins the model revision and the SHA-256 digests of the ONNX graph and tokenizer. Startup verifies both files against that manifest before constructing an inference session. The loader reads the explicit local bundle and performs no model-hub lookup or network download."
+    },
+    {
+      "path": "docs/en/cpu-provider.md",
+      "language": "en",
+      "role": "relevant",
+      "content": "# CPU execution requirement\n\nEmbedding inference is qualified only when ONNX Runtime reports `CPUExecutionProvider` as the active provider. The session requests that provider explicitly and validates the returned provider list. If CPU execution is unavailable, setup fails instead of moving work to a GPU or remote service."
+    },
+    {
+      "path": "docs/en/editor-preview.md",
+      "language": "en",
+      "role": "distractor",
+      "content": "# Previewing generated edits\n\nCode changes are shown as a reviewable diff before approval. The preview groups added and removed lines and lets the user accept or reject the proposed patch. It does not execute project code while rendering the diff."
+    },
+    {
+      "path": "docs/en/task-queue.md",
+      "language": "en",
+      "role": "distractor",
+      "content": "# Local task queue\n\nLong-running desktop tasks can be queued and resumed after a window refresh. Queue entries contain a task identifier and user-visible state, not project source text. A completed task is not retried automatically."
+    },
+    {
+      "path": "code/index_generation.py",
+      "language": "code",
+      "role": "relevant",
+      "content": "\"\"\"Build and activate one immutable project index generation.\"\"\"\n\nclass GenerationBuilder:\n    \"\"\"Stage chunks and FTS rows, validate equal counts, then atomically switch active_generation.\"\"\"\n\n    def rebuild(self, chunks, connection):\n        \"\"\"An exception before commit leaves the previous active generation untouched.\"\"\"\n        generation = self.stage(chunks, connection)\n        self.validate_chunk_and_fts_counts(generation, connection)\n        connection.execute(\"UPDATE active_generation SET generation_id = ?\", (generation.id,))\n        connection.commit()\n        return generation\n"
+    },
+    {
+      "path": "code/rrf.py",
+      "language": "code",
+      "role": "relevant",
+      "content": "\"\"\"Fuse lexical and dense ranks without comparing unlike raw scores.\"\"\"\n\nRRF_K = 60\n\ndef reciprocal_rank_fusion(lexical_rank, dense_rank):\n    \"\"\"Return sum(1 / (RRF_K + rank)) for each present one-based rank.\"\"\"\n    score = 0.0\n    for rank in (lexical_rank, dense_rank):\n        if rank is not None:\n            score += 1.0 / (RRF_K + rank)\n    return score\n"
+    },
+    {
+      "path": "code/worker_protocol.py",
+      "language": "code",
+      "role": "relevant",
+      "content": "\"\"\"Accept a fixed one-shot JSON operation; never execute request text.\"\"\"\n\nimport subprocess\n\nOPERATIONS = {\"index\", \"search\"}\nMAX_REQUEST_BYTES = 16 * 1024\n\ndef start_worker(python_exe, worker_file, request_json):\n    \"\"\"Use fixed argv, stdin JSON, shell=False, bounded output, and a timeout.\"\"\"\n    return subprocess.run(\n        [python_exe, \"-I\", worker_file], input=request_json, capture_output=True,\n        timeout=120, check=False, shell=False\n    )\n"
+    },
+    {
+      "path": "code/e5_contract.py",
+      "language": "code",
+      "role": "relevant",
+      "content": "\"\"\"Keep query and passage encoding on the same E5 contract.\"\"\"\n\nQUERY_PREFIX = \"query: \"\nPASSAGE_PREFIX = \"passage: \"\nDIMENSION = 384\n\ndef pool_token_states(token_states, attention_mask):\n    \"\"\"Compute masked-mean pooling, then L2-normalize the vector.\"\"\"\n    masked_mean = sum_visible_states(token_states, attention_mask)\n    return l2_normalize(masked_mean)\n"
+    },
+    {
+      "path": "code/workspace_policy.py",
+      "language": "code",
+      "role": "relevant",
+      "content": "\"\"\"Apply the allowlist and secret exclusions before indexing workspace text.\"\"\"\n\nEXCLUDED_DIRS = {\".git\", \".venv\", \"build\", \"node_modules\"}\nSENSITIVE_NAMES = {\"credentials.json\", \"secrets.json\", \"id_rsa\"}\n\ndef eligible(path, text):\n    \"\"\"Reject hidden paths, non-allowlisted suffixes, links, and secret patterns.\"\"\"\n    if has_hidden_component(path) or excluded_directory(path):\n        return False\n    return allowed_text_suffix(path) and not sensitive_content(text)\n"
+    },
+    {
+      "path": "code/project_scope.py",
+      "language": "code",
+      "role": "relevant",
+      "content": "\"\"\"Keep active generations and every retrieval operation project-scoped.\"\"\"\n\nimport hashlib\n\ndef stable_project_id(canonical_local_root):\n    \"\"\"Hash a normalized selected root; never merge rows across project IDs.\"\"\"\n    return \"workspace-\" + hashlib.sha256(canonical_local_root.encode()).hexdigest()\n\ndef search(database, project_id, query):\n    \"\"\"Read only the active generation whose project_id matches this request.\"\"\"\n    return database.active_chunks(project_id, query)\n"
+    },
+    {
+      "path": "code/structured_logging.py",
+      "language": "code",
+      "role": "distractor",
+      "content": "\"\"\"Write short structured lifecycle events without source text.\"\"\"\n\nEVENT_LEVELS = {\"debug\", \"info\", \"warning\", \"error\"}\n\ndef record_event(event_name, correlation_id):\n    \"\"\"Persist only an allowlisted event name and opaque correlation identifier.\"\"\"\n    return {\"event\": validate_name(event_name), \"correlation_id\": correlation_id}\n"
+    },
+    {
+      "path": "code/runtime_health.py",
+      "language": "code",
+      "role": "distractor",
+      "content": "\"\"\"Report health for a locally launched model runtime process.\"\"\"\n\ndef health_status(process):\n    \"\"\"Return running, stopped, or unknown from process state and heartbeat age.\"\"\"\n    if process.exited:\n        return \"stopped\"\n    return \"running\" if process.heartbeat_is_fresh else \"unknown\"\n"
+    }
+  ],
+  "queries": [
+    {"id":"de-01","language":"de","query":"Was bleibt für Suchanfragen verfügbar, wenn ein Neuaufbau der Generation vor dem Umschalten fehlschlägt?","relevant_paths":["docs/de/atomarer-neuaufbau.md"]},
+    {"id":"de-02","language":"de","query":"Wie werden Anfrage und gespeicherte Passagen vor dem Vergleich unterschiedlich markiert und normalisiert?","relevant_paths":["docs/de/e5-vertrag.md"]},
+    {"id":"de-03","language":"de","query":"Welche Inhalte darf der lokale Scanner weder in den Index übernehmen noch protokollieren?","relevant_paths":["docs/de/ausschlussregeln.md"]},
+    {"id":"de-04","language":"de","query":"Wie oft darf ein bestätigter RAG-Ausschnitt im Gespräch verwendet werden?","relevant_paths":["docs/de/einmaliger-chat-kontext.md"]},
+    {"id":"de-05","language":"de","query":"Wodurch wird verhindert, dass eine Suche Treffer aus zwei ausgewählten Projekten mischt?","relevant_paths":["docs/de/projekt-isolation.md"]},
+    {"id":"de-06","language":"de","query":"Was geschieht, wenn die lokale CPU-Laufzeit oder ein geprüftes Embedding-Artefakt fehlt?","relevant_paths":["docs/de/offline-cpu.md"]},
+    {"id":"en-01","language":"en","query":"How are exact word matches combined with semantic vector candidates without treating their scores as the same scale?","relevant_paths":["docs/en/lexical-ranking.md"]},
+    {"id":"en-02","language":"en","query":"What cap applies to the number of excerpts returned to the chat by a single search?","relevant_paths":["docs/en/result-bound.md"]},
+    {"id":"en-03","language":"en","query":"How does the host keep user query text from becoming an operating-system command when launching retrieval?","relevant_paths":["docs/en/worker-boundary.md"]},
+    {"id":"en-04","language":"en","query":"Which location details accompany a passage so a person can trace it without seeing the absolute project root?","relevant_paths":["docs/en/source-locations.md"]},
+    {"id":"en-05","language":"en","query":"What verifies the downloaded local encoder files before inference starts, while remaining offline?","relevant_paths":["docs/en/manifest-verification.md"]},
+    {"id":"en-06","language":"en","query":"Which execution backend must be active for embeddings, and what is the behavior if that backend is unavailable?","relevant_paths":["docs/en/cpu-provider.md"]},
+    {"id":"code-01","language":"code","query":"In the generation builder, what happens if validation fails before the active pointer commit?","relevant_paths":["code/index_generation.py"]},
+    {"id":"code-02","language":"code","query":"What formula does reciprocal_rank_fusion use when lexical_rank or dense_rank is absent?","relevant_paths":["code/rrf.py"]},
+    {"id":"code-03","language":"code","query":"How does start_worker prevent shell interpretation and constrain its executable request path?","relevant_paths":["code/worker_protocol.py"]},
+    {"id":"code-04","language":"code","query":"Which prefixes, pooling rule, vector width, and final normalization are part of the E5 encoder contract?","relevant_paths":["code/e5_contract.py"]},
+    {"id":"code-05","language":"code","query":"Which path and content conditions make eligible reject a workspace file before indexing?","relevant_paths":["code/workspace_policy.py"]},
+    {"id":"code-06","language":"code","query":"How does the search helper choose rows when a database contains multiple project generations?","relevant_paths":["code/project_scope.py"]}
+  ]
+}

@@ -24,6 +24,13 @@ from enum import Enum
 from pathlib import Path
 from typing import ClassVar, TextIO
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 uses the declared tomli dependency.
+    import tomli as tomllib
+
+from dbzscc.miro.model_registry import ModelCatalogEntry
+
 from .execution_events import ExecutionEvent, ExecutionEventType, redact_text
 from .file_edit_service import validate_working_root
 from .resource_orchestrator import (
@@ -62,6 +69,17 @@ class ProjectOperation(str, Enum):
 
 
 @dataclass(frozen=True)
+class ProjectPipelineManifest:
+    """Validated targets from pyproject metadata; commands remain app-owned."""
+
+    pytest_paths: tuple[str, ...]
+    ruff_paths: tuple[str, ...]
+
+    def paths_for(self, operation: ProjectOperation) -> tuple[str, ...]:
+        return self.pytest_paths if operation is ProjectOperation.TESTS else self.ruff_paths
+
+
+@dataclass(frozen=True)
 class ProjectExecutionPlan:
     """A typed action bound to one project snapshot, interpreter and run ID."""
 
@@ -75,6 +93,7 @@ class ProjectExecutionPlan:
     project_root: Path
     project_fingerprint: str
     python_relative_path: str
+    model_catalog_entry: ModelCatalogEntry | None = None
 
     @property
     def argv(self) -> tuple[str, ...]:
@@ -232,10 +251,10 @@ class ProjectExecutionService:
 
     _COMMANDS: ClassVar[dict[ProjectOperation, tuple[str, ...]]] = {
         ProjectOperation.TESTS: (
-            "-I", "-B", "-m", "pytest", "-p", "no:cacheprovider", "-q", "tests"
+            "-I", "-B", "-m", "pytest", "-p", "no:cacheprovider", "-q"
         ),
         ProjectOperation.LINTER: (
-            "-I", "-B", "-m", "ruff", "check", "--no-cache", "src", "tests"
+            "-I", "-B", "-m", "ruff", "check", "--no-cache"
         ),
     }
     _SECRET_ENV: ClassVar[re.Pattern[str]] = re.compile(
@@ -284,12 +303,17 @@ class ProjectExecutionService:
         python_executable: str | os.PathLike[str],
         conversation_id: str,
         workflow_id: str,
+        run_id: str | None = None,
     ) -> tuple[ProjectExecutionPlan, ...]:
         """Validate typed allowlisted actions, exact paths and fresh resource plans."""
         if not isinstance(workflow_plan, WorkflowPlan):
             raise ProjectExecutionError("Die Workflowdaten sind kein validierter LangChain-Plan.")
         if not conversation_id.strip() or not workflow_id.strip():
             raise ProjectExecutionError("Chat- und Workflow-ID müssen vorhanden sein.")
+        if run_id is not None and (
+            not isinstance(run_id, str) or not run_id.strip() or len(run_id) > 128
+        ):
+            raise ProjectExecutionError("Die workflowweite Run-ID ist ungültig.")
         selected = tuple(actions)
         if not selected or len(selected) > self.MAX_PLAN_ACTIONS:
             raise ProjectExecutionError("Es können nur ein oder zwei geprüfte Aktionen freigegeben werden.")
@@ -301,9 +325,22 @@ class ProjectExecutionService:
             if action.value not in {operation.value for operation in ProjectOperation}:
                 raise ProjectExecutionError("Diese Modellaktion besitzt keinen ausführbaren Consumer.")
 
+        catalog_entry = workflow_plan.model_catalog_entry
+        if (
+            not isinstance(catalog_entry, ModelCatalogEntry)
+            or catalog_entry.observation is None
+            or catalog_entry.artifact.status != "metadata_read"
+            or catalog_entry.observation.status != "metadata_read"
+            or catalog_entry.artifact.current_observation_id
+            != catalog_entry.observation.observation_id
+            or workflow_plan.model_artifact_id != catalog_entry.artifact.artifact_id
+            or workflow_plan.model_observation_id != catalog_entry.observation.observation_id
+        ):
+            raise ProjectExecutionError("Der Workflowplan besitzt keinen aktuellen zentralen MIRO-Modellbeleg.")
         root = _validate_project_root(project_root)
         python_path = _validate_project_python(root, python_executable)
         _require_python_project(root)
+        manifest = _read_project_pipeline(root)
         fingerprint = _project_fingerprint(root)
         registry = RuntimeRegistry()
         discovery = registry.discover_explicit((
@@ -319,6 +356,7 @@ class ProjectExecutionService:
             raise ProjectExecutionError("Der ausdrücklich gewählte Python-Interpreter ist nicht verfügbar.")
 
         plans: list[ProjectExecutionPlan] = []
+        persistent_run_id = run_id or uuid.uuid4().hex
         for action in selected:
             operation = ProjectOperation(action.value)
             module = "pytest" if operation is ProjectOperation.TESTS else "ruff"
@@ -333,19 +371,19 @@ class ProjectExecutionService:
                 if operation is ProjectOperation.TESTS
                 else self.LINTER_TIMEOUT_S
             )
-            run_id = uuid.uuid4().hex
+            invocation_id = f"{uuid.uuid4().hex}-{operation.value}"
             demand = ResourceDemand(
-                workload_id=f"project-{operation.value}-{run_id[:12]}",
+                workload_id=f"project-{operation.value}-{persistent_run_id[:12]}-{uuid.uuid4().hex[:8]}",
                 runtime_id=self.RUNTIME_ID,
                 peak_memory_mib=memory,
                 cpu_threads=self.CPU_THREADS,
                 min_cpu_threads=1,
             )
             invocation = OneShotInvocation(
-                invocation_id=run_id,
+                invocation_id=invocation_id,
                 runtime_id=self.RUNTIME_ID,
                 operation=InvocationOperation.GENERIC,
-                argv=self._COMMANDS[operation],
+                argv=(*self._COMMANDS[operation], *manifest.paths_for(operation)),
                 project_root=root,
                 working_directory=root,
                 timeout_s=timeout,
@@ -367,10 +405,11 @@ class ProjectExecutionService:
                 resource_plan=resource_plan,
                 conversation_id=conversation_id,
                 workflow_id=workflow_id,
-                run_id=run_id,
+                run_id=persistent_run_id,
                 project_root=root,
                 project_fingerprint=fingerprint,
                 python_relative_path=python_path.relative_to(root).as_posix(),
+                model_catalog_entry=catalog_entry,
             ))
         return tuple(plans)
 
@@ -386,13 +425,19 @@ class ProjectExecutionService:
             raise TypeError("cancel_event must be a threading.Event.")
         if plan.action.value not in {operation.value for operation in ProjectOperation}:
             raise ProjectExecutionError("Nicht erlaubte Projektaktion.")
-        if tuple(plan.invocation.argv) != self._COMMANDS[plan.action]:
+        manifest = _read_project_pipeline(plan.project_root)
+        expected_argv = (*self._COMMANDS[plan.action], *manifest.paths_for(plan.action))
+        if tuple(plan.invocation.argv) != expected_argv:
             raise ProjectExecutionError("Der Invocation-Plan enthält keine feste Allowlist-argv.")
         if Path(plan.invocation.executable_path) != plan.project_root / plan.python_relative_path:
             raise ProjectExecutionError("Interpreterpfad und Projektbeleg stimmen nicht überein.")
         if _project_fingerprint(plan.project_root) != plan.project_fingerprint:
             raise ProjectExecutionError("Projektdateien haben sich seit dem Plan geändert; bitte neu planen.")
         if cancel_event.is_set():
+            self._emit(
+                plan, ExecutionEventType.STATUS, "Abgebrochen · kein Projektprozess gestartet.",
+                state=OneShotState.CANCELLED.value,
+            )
             return ProjectExecutionResult(
                 plan,
                 OneShotOutcome(plan.run_id, OneShotState.CANCELLED),
@@ -411,6 +456,7 @@ class ProjectExecutionService:
             plan,
             ExecutionEventType.WORKFLOW_STARTED,
             f"Projektaktion gestartet · {plan.action.value} · app-eigener Prozess.",
+            state="running",
         )
         self._emit(
             plan,
@@ -418,6 +464,7 @@ class ProjectExecutionService:
             "Pfad-, Quellfingerprint- und Ressourcen-Gates erneut bestanden; "
             f"{fresh_resource_plan.status.value}, Hostreserve {fresh_resource_plan.host_memory_mib} MiB, "
             f"CPU-Threads {fresh_resource_plan.cpu_threads}.",
+            state="running",
         )
         self._emit(
             plan,
@@ -460,6 +507,7 @@ class ProjectExecutionService:
             ExecutionEventType.PROGRESS,
             f"App-eigener Prozess gestartet · PID {process.pid} · Timeout {plan.invocation.timeout_s:.0f} s.",
             provenance=(("pid", str(process.pid)),),
+            state="running",
         )
         result = self._monitor_process(plan, process, tree_guard, cancel_event)
         with self._lock:
@@ -540,10 +588,18 @@ class ProjectExecutionService:
             if outcome_state is None:
                 if cancel_event.is_set():
                     outcome_state = OneShotState.CANCELLED
-                    self._emit(plan, ExecutionEventType.STATUS, "Abbruch angefordert · beende nur den app-eigenen Prozessbaum.")
+                    self._emit(
+                        plan, ExecutionEventType.STATUS,
+                        "Abbruch angefordert · beende nur den app-eigenen Prozessbaum.",
+                        state=outcome_state.value,
+                    )
                 elif self._monotonic() >= deadline:
                     outcome_state = OneShotState.TIMED_OUT
-                    self._emit(plan, ExecutionEventType.ERROR, "Zeitlimit erreicht · beende nur den app-eigenen Prozessbaum.")
+                    self._emit(
+                        plan, ExecutionEventType.ERROR,
+                        "Zeitlimit erreicht · beende nur den app-eigenen Prozessbaum.",
+                        state=outcome_state.value,
+                    )
                 if outcome_state is not None:
                     try:
                         tree_guard.terminate(process)
@@ -582,7 +638,7 @@ class ProjectExecutionService:
                 summary_parts.append(addition[:available])
                 summary_chars += min(len(addition), available)
             if event_count < self.MAX_OUTPUT_EVENTS and event_chars + len(safe) <= self.MAX_OUTPUT_CHARS:
-                self._emit(plan, item.event_type, safe)
+                self._emit(plan, item.event_type, safe, state="running")
                 event_count += 1
                 event_chars += len(safe)
             elif not truncated:
@@ -617,6 +673,7 @@ class ProjectExecutionService:
             exit_text,
             exit_code=exit_code,
             provenance=(("operation", plan.action.value), ("state", outcome_state.value)),
+            state=outcome_state.value,
         )
         return ProjectExecutionResult(
             plan,
@@ -634,12 +691,28 @@ class ProjectExecutionService:
         source: str = "project-execution",
         exit_code: int | None = None,
         provenance: tuple[tuple[str, str], ...] = (),
+        state: str | None = None,
     ) -> None:
         base = (
             ("action", plan.action.value),
             ("python", plan.python_relative_path),
-            ("workspace_sha256", plan.project_fingerprint[:16]),
+            ("project_fingerprint", plan.project_fingerprint),
             ("resource_status", plan.resource_plan.status.value),
+        )
+        entry = plan.model_catalog_entry
+        observation = entry.observation if entry is not None else None
+        model_evidence = (
+            (
+                ("model_artifact_id", entry.artifact.artifact_id),
+                ("model_observation_id", observation.observation_id),
+                ("model_identity_id", entry.model.model_id if entry.model is not None else "unresolved"),
+                (
+                    "model_metadata_prefix_sha256",
+                    getattr(observation, "metadata_prefix_sha256", None) or "missing",
+                ),
+            )
+            if entry is not None and observation is not None
+            else ()
         )
         event = ExecutionEvent(
             conversation_id=plan.conversation_id,
@@ -649,7 +722,9 @@ class ProjectExecutionService:
             text=text,
             source=source,
             exit_code=exit_code,
-            provenance=base + provenance,
+            provenance=base + model_evidence + provenance,
+            state=state,
+            step_id=plan.action.value,
         )
         try:
             self._event_sink(event)
@@ -740,6 +815,82 @@ def _require_python_project(root: Path) -> None:
     _require_regular_file(root / "pyproject.toml", root)
     _require_directory(root / "src", root)
     _require_directory(root / "tests", root)
+
+
+def _read_project_pipeline(root: Path) -> ProjectPipelineManifest:
+    """Read only declarative source/test targets; execution commands stay fixed."""
+    manifest_path = root / "pyproject.toml"
+    _require_regular_file(manifest_path, root)
+    try:
+        raw = manifest_path.read_bytes()
+        if len(raw) > 1_000_000:
+            raise ProjectExecutionError("pyproject.toml überschreitet das Manifest-Limit von 1 MB.")
+        document = tomllib.loads(raw.decode("utf-8-sig", errors="strict"))
+    except ProjectExecutionError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ProjectExecutionError("pyproject.toml ist kein gültiges UTF-8/TOML-Manifest.") from exc
+    tool = document.get("tool", {})
+    if not isinstance(tool, dict):
+        raise ProjectExecutionError("Der tool-Abschnitt in pyproject.toml ist ungültig.")
+    dbzscc = tool.get("dbzscc", {})
+    if not isinstance(dbzscc, dict):
+        raise ProjectExecutionError("Der tool.dbzscc-Abschnitt ist ungültig.")
+    execution = dbzscc.get("execution", {})
+    if not isinstance(execution, dict):
+        raise ProjectExecutionError("tool.dbzscc.execution muss eine TOML-Tabelle sein.")
+    unknown = set(execution) - {"pytest_paths", "ruff_paths"}
+    if unknown:
+        raise ProjectExecutionError(
+            "Nicht unterstützte tool.dbzscc.execution-Felder: " + ", ".join(sorted(unknown))
+        )
+
+    pytest_config = tool.get("pytest", {})
+    ini_options = pytest_config.get("ini_options", {}) if isinstance(pytest_config, dict) else {}
+    if not isinstance(ini_options, dict):
+        raise ProjectExecutionError("tool.pytest.ini_options muss eine TOML-Tabelle sein.")
+    pytest_defaults = ini_options.get("testpaths", ["tests"])
+    pytest_paths = execution.get("pytest_paths", pytest_defaults)
+    ruff_paths = execution.get("ruff_paths", ["src", "tests"])
+    return ProjectPipelineManifest(
+        pytest_paths=_validate_pipeline_targets(root, pytest_paths, "pytest_paths"),
+        ruff_paths=_validate_pipeline_targets(root, ruff_paths, "ruff_paths"),
+    )
+
+
+def _validate_pipeline_targets(root: Path, value: object, field_name: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > 24
+        or any(not isinstance(item, str) for item in value)
+    ):
+        raise ProjectExecutionError(f"{field_name} muss eine Liste mit 1 bis 24 Pfaden sein.")
+    normalized: list[str] = []
+    for item in value:
+        if not item or len(item) > 120 or "\\" in item or any(ord(char) < 32 for char in item):
+            raise ProjectExecutionError(f"{field_name} enthält einen ungültigen Pfad.")
+        parts = item.split("/")
+        if (
+            item.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+            or parts[0] not in {"src", "tests"}
+        ):
+            raise ProjectExecutionError(
+                f"{field_name} darf nur sichere relative Pfade unter src/ oder tests/ enthalten."
+            )
+        target = root.joinpath(*parts)
+        _validate_contained_path(target, root)
+        try:
+            metadata = target.lstat()
+        except OSError as exc:
+            raise ProjectExecutionError(f"{field_name} verweist auf einen fehlenden Pfad: {item}.") from exc
+        if _is_reparse(metadata) or not (target.is_dir() or target.is_file()):
+            raise ProjectExecutionError(f"{field_name} enthält einen Link oder Sonderpfad: {item}.")
+        normalized.append("/".join(parts))
+    if len(set(normalized)) != len(normalized):
+        raise ProjectExecutionError(f"{field_name} enthält doppelte Targets.")
+    return tuple(normalized)
 
 
 def _require_venv_module(python_path: Path, module: str) -> None:

@@ -234,3 +234,121 @@ def test_registry_data_survives_reopen_and_runtime_candidates_stay_unlinked(
 def test_rejects_non_persistent_memory_database_path(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="persistent file path"):
         LocalModelRegistry(":memory:")
+
+
+def test_scan_with_root_error_is_persisted_as_partial_not_completed(tmp_path: Path) -> None:
+    root = tmp_path / "unavailable-model-root"
+    registry = LocalModelRegistry(tmp_path / "registry.sqlite")
+
+    result = registry.synchronize(model_roots=[root])
+
+    assert result.complete
+    with registry._connection() as connection:
+        run = connection.execute(
+            "SELECT state, completed_at, continuation_token, issues_json FROM discovery_runs WHERE run_id = ?",
+            (result.run_id,),
+        ).fetchone()
+    assert run["state"] == "partial"
+    assert run["completed_at"] is None
+    assert run["continuation_token"] is None
+    assert '"code":"root_not_found"' in run["issues_json"]
+    assert registry.get_resumable_scan([root]) is None
+
+
+
+def test_v3_schema_migrates_additively_to_v5_scan_and_fullhash_metrics(tmp_path: Path) -> None:
+    import dbzscc.miro.model_registry as registry_module
+
+    database = tmp_path / "registry-v3.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        for version, migration in enumerate(
+            (
+                registry_module._MIGRATION_1,
+                registry_module._MIGRATION_2,
+                registry_module._MIGRATION_3,
+            ),
+            start=1,
+        ):
+            for statement in migration:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (version, "2026-11-03T00:00:00Z"),
+            )
+        connection.execute(
+            """INSERT INTO discovery_runs (
+                run_id, roots_fingerprint, roots_json, started_at, updated_at,
+                completed_at, state, continuation_token, directories_visited,
+                entries_seen, regular_files_seen, artifacts_seen, parse_failures,
+                issues_json
+            ) VALUES ('legacy-run', 'fp', '{}', 't', 't', 't', 'completed',
+                     NULL, 5, 7, 2, 0, 0, '[]')"""
+        )
+
+    migrated = LocalModelRegistry(database)
+    record = migrated.get_discovery_run("legacy-run")
+    assert record is not None
+    assert record.directories_visited == 5
+    assert record.entries_seen == 7
+    assert record.regular_files_seen == 2
+    assert record.reparse_points_skipped == 0
+    assert record.access_denied_directories == 0
+    assert record.non_gguf_artifacts_seen == 0
+    with migrated._connection() as connection:
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(discovery_runs)")
+        }
+        qualification_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(runtime_qualifications)")
+        }
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert versions == [1, 2, 3, 4, 5]
+    assert {
+        "reparse_points_skipped",
+        "access_denied_directories",
+        "non_gguf_artifacts_seen",
+    } <= columns
+    assert {
+        "model_full_file_sha256",
+        "projector_full_file_sha256",
+        "device_physical_id",
+        "runtime_parameters_json",
+    } <= qualification_columns
+    assert "artifact_full_hashes" in tables
+
+
+def test_discovery_run_metrics_persist_and_survive_reopen(tmp_path: Path) -> None:
+    models = tmp_path / "models"
+    _gguf(models / "model.gguf", _metadata())
+    models.mkdir(exist_ok=True)
+    (models / "projector.safetensors").write_bytes(b"not a GGUF model")
+    database = tmp_path / "registry.sqlite"
+    registry = LocalModelRegistry(database)
+
+    result = registry.synchronize(model_roots=[models])
+    reopened = LocalModelRegistry(database)
+    record = reopened.get_discovery_run(result.run_id)
+
+    assert record is not None
+    assert result.complete
+    assert result.artifact_count == record.artifacts_seen == 2
+    assert result.parse_failure_count == record.parse_failures == 0
+    assert result.non_gguf_artifact_count == record.non_gguf_artifacts_seen == 1
+    assert result.reparse_points_skipped == record.reparse_points_skipped == 0
+    assert result.access_denied_directories == record.access_denied_directories == 0
+    assert record.regular_files_seen == 2

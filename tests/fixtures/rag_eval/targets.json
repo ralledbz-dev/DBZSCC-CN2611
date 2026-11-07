@@ -1,0 +1,47 @@
+{
+  "suite_id": "dbzscc2611-offline-rag-synthetic-v1",
+  "frozen_before_real_worker_measurement": true,
+  "evaluation_fixture_sha256": "2cb2764db01e41d37e78464739b4729d45fd23488e184f330cfd9e1384d76fd9",
+  "protocol": {
+    "documents": 24,
+    "relevant_documents": 18,
+    "distractor_documents": 6,
+    "queries_total": 18,
+    "queries_per_group": 6,
+    "groups": ["de", "en", "code"],
+    "one_relevant_path_per_query": true,
+    "worker_result_limit": 5,
+    "search_trials_per_query": 1,
+    "retrieval_metrics": ["Recall@1", "Recall@3", "Recall@5", "MRR@5", "nDCG@5"],
+    "ndcg_relevance": "binary; one relevant path per query",
+    "latency_clock": "perf_counter_ns around the complete LocalRagWorkerClient method call"
+  },
+  "retrieval_targets": {
+    "overall": {
+      "recall_at_1_min": 0.67,
+      "recall_at_3_min": 0.89,
+      "recall_at_5_min": 0.95,
+      "mrr_at_5_min": 0.83,
+      "ndcg_at_5_min": 0.90
+    },
+    "per_group": {
+      "recall_at_1_min": 0.50,
+      "recall_at_3_min": 0.83,
+      "recall_at_5_min": 0.83,
+      "mrr_at_5_min": 0.75,
+      "ndcg_at_5_min": 0.80
+    }
+  },
+  "latency_targets_ms": {
+    "search_worker_roundtrip_p50_max": 5000,
+    "search_worker_roundtrip_p95_max": 15000,
+    "index_worker_roundtrip_single_max": 60000
+  },
+  "percentile_method": "linear interpolation on sorted samples at position (n - 1) * p",
+  "interpretation_limits": [
+    "This is a small synthetic regression fixture, not a representative user-project benchmark.",
+    "Search timing includes process startup, local artifact hash verification, ONNX session construction, retrieval and response parsing because each fixed worker accepts one request.",
+    "The worker does not expose internal embedding, lexical, dense or fusion timings; these are not inferred or claimed.",
+    "No threshold may be lowered after seeing measured results; failed or inconclusive targets remain explicitly reported."
+  ]
+}

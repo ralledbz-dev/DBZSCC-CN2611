@@ -25,6 +25,23 @@ def test_conversations_and_messages_persist_in_order(tmp_path: Path) -> None:
     assert listed[0].updated_at >= listed[0].created_at
 
 
+def test_managed_runtime_build_hash_round_trips_in_chat_metadata(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "chat.sqlite")
+    conversation = store.create_conversation()
+    metadata = {"runtime_build_sha256": "a" * 64}
+
+    stored = store.add_message(
+        conversation.conversation_id,
+        "assistant",
+        "Vollständige Runtimeantwort",
+        metadata=metadata,
+    )
+
+    reloaded = store.get_message(stored.message_id)
+    assert reloaded is not None
+    assert dict(reloaded.metadata) == metadata
+
+
 def test_rejects_empty_messages_invalid_roles_and_unknown_conversations(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "chat.sqlite")
     conversation = store.create_conversation()

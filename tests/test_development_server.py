@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ from dbzscc.app.development_server import (
 from dbzscc.app.execution_events import ExecutionEventType
 from dbzscc.app.resource_orchestrator import ResourceSnapshot, TelemetryQuality
 from dbzscc.app.workflow_runtime import WorkflowAction, WorkflowPlan
+from dbzscc.miro.model_registry import ModelCatalogEntry
 
 
 class _ResourceMonitor:
@@ -93,8 +95,35 @@ def pyside_project(tmp_path: Path) -> tuple[Path, Path]:
     return root, python
 
 
+def _catalog_entry() -> ModelCatalogEntry:
+    observation = SimpleNamespace(observation_id="observation-1", status="metadata_read")
+    artifact = SimpleNamespace(
+        artifact_id="artifact-1",
+        current_observation_id=observation.observation_id,
+        status="metadata_read",
+    )
+    return ModelCatalogEntry(
+        artifact=artifact,
+        model=None,
+        observation=observation,
+        selected_metadata=(),
+        capability_evidence_json="{}",
+        runtime_qualifications=(),
+        multimodal_pairings=(),
+    )
+
+
 def _plan(action=WorkflowAction.START_DEVELOPMENT_SERVER):
-    return WorkflowPlan((action,), "Nur explizit freigegebene lokale Ausführung.", "local-model")
+    entry = _catalog_entry()
+    return WorkflowPlan(
+        (action,),
+        "Nur explizit freigegebene lokale Ausführung.",
+        "local-model",
+        model_artifact_id=entry.artifact.artifact_id,
+        model_observation_id=entry.observation.observation_id,
+        model_catalog_status="current_registry_record",
+        model_catalog_entry=entry,
+    )
 
 
 def _controller(events, runner=None, guard=None, health_probe=None):
@@ -110,8 +139,9 @@ def _controller(events, runner=None, guard=None, health_probe=None):
 def test_prepare_composes_only_the_fixed_pyside6_module_argv(pyside_project) -> None:
     root, python = pyside_project
     controller = _controller([])
+    workflow_plan = _plan()
     plan = controller.prepare(
-        _plan(),
+        workflow_plan,
         WorkflowAction.START_DEVELOPMENT_SERVER,
         project_root=root,
         python_executable=python,
@@ -124,6 +154,7 @@ def test_prepare_composes_only_the_fixed_pyside6_module_argv(pyside_project) -> 
     assert plan.argv == (str(python), "-B", "-m", "demo")
     assert plan.endpoint is None
     assert plan.resource_plan.admitted
+    assert plan.model_catalog_entry is workflow_plan.model_catalog_entry
 
 
 def test_debug_action_uses_fixed_python_diagnostic_flags(pyside_project) -> None:

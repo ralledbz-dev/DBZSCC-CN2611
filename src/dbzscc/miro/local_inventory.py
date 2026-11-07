@@ -20,6 +20,7 @@ from typing import Union
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _RUNTIME_TOOL_PREFIX = "llama-"
 _RUNTIME_TOOL_SUFFIXES = frozenset(("", ".exe"))
+_NON_GGUF_MODEL_SUFFIXES = frozenset((".safetensors", ".bin", ".pt", ".pth", ".onnx"))
 
 RootInput = Union[str, os.PathLike]
 
@@ -60,6 +61,8 @@ class InventoryScan:
     regular_files_seen: int = 0
     reparse_points_skipped: int = 0
     access_denied_directories: int = 0
+    continuation_token: str | None = None
+    complete: bool = True
 
 
 @dataclass
@@ -423,6 +426,9 @@ def _classify_candidate(
 ) -> tuple[str, str] | None:
     if category == "model" and filename.casefold().endswith(".gguf"):
         return "gguf_candidate", "filename-extension:.gguf"
+    if category == "model" and Path(filename).suffix.casefold() in _NON_GGUF_MODEL_SUFFIXES:
+        suffix = Path(filename).suffix.casefold()
+        return "non_gguf_model_candidate", f"filename-extension:{suffix};startable:false"
 
     if category == "runtime":
         stem, suffix = os.path.splitext(filename)

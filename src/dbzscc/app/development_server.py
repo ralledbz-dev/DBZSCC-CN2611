@@ -31,6 +31,8 @@ except ModuleNotFoundError:  # Python 3.10 installations may supply tomli as pro
     except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10 without tomli.
         tomllib = None
 
+from dbzscc.miro.model_registry import ModelCatalogEntry
+
 from .execution_events import ExecutionEvent, ExecutionEventType, redact_text
 from .project_execution import (
     ProjectExecutionError,
@@ -127,6 +129,7 @@ class DevelopmentServerPlan:
     conversation_id: str
     workflow_id: str
     run_id: str
+    model_catalog_entry: ModelCatalogEntry | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +198,18 @@ class DevelopmentServerController:
             or action not in workflow_plan.actions
         ):
             raise DevelopmentServerError("Die Serveraktion ist nicht Teil des validierten Workflowplans.")
+        catalog_entry = workflow_plan.model_catalog_entry
+        if (
+            not isinstance(catalog_entry, ModelCatalogEntry)
+            or catalog_entry.observation is None
+            or catalog_entry.artifact.status != "metadata_read"
+            or catalog_entry.observation.status != "metadata_read"
+            or catalog_entry.artifact.current_observation_id
+            != catalog_entry.observation.observation_id
+            or workflow_plan.model_artifact_id != catalog_entry.artifact.artifact_id
+            or workflow_plan.model_observation_id != catalog_entry.observation.observation_id
+        ):
+            raise DevelopmentServerError("Der Workflowplan besitzt keinen aktuellen zentralen MIRO-Modellbeleg.")
         if action not in {WorkflowAction.START_DEVELOPMENT_SERVER, WorkflowAction.DEBUG_PROJECT}:
             raise DevelopmentServerError("Nur die typisierten Server- und Debug-Aktionen werden unterstützt.")
         if not conversation_id.strip() or not workflow_id.strip():
@@ -255,6 +270,7 @@ class DevelopmentServerController:
             conversation_id=conversation_id,
             workflow_id=workflow_id,
             run_id=uuid.uuid4().hex,
+            model_catalog_entry=catalog_entry,
         )
 
     def start(

@@ -19,6 +19,8 @@ from urllib.request import (
     urlopen,
 )
 
+from dbzscc.miro.model_registry import ModelCatalogEntry
+
 from .config import AppSettings
 
 
@@ -69,6 +71,33 @@ class ChatMessage:
         if not isinstance(self.content, str):
             raise TypeError("Chat message content must be text.")
 
+@dataclass(frozen=True)
+class CatalogChatModel:
+    """A chat-server model name explicitly bound to one current MIRO record."""
+
+    model_name: str
+    model_catalog_entry: ModelCatalogEntry
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model_name, str) or not self.model_name.strip():
+            raise ValueError("A catalog-backed chat model requires a model name.")
+        entry = self.model_catalog_entry
+        if (
+            not isinstance(entry, ModelCatalogEntry)
+            or entry.observation is None
+            or entry.artifact.status != "metadata_read"
+            or entry.observation.status != "metadata_read"
+            or entry.artifact.current_observation_id != entry.observation.observation_id
+        ):
+            raise ValueError("Chat requires a current parsed ModelCatalogEntry.")
+
+def _selected_model_name(value: str | CatalogChatModel) -> str:
+    if isinstance(value, CatalogChatModel):
+        return value.model_name.strip()
+    if not isinstance(value, str):
+        raise TypeError("Chat model must be a string or a catalog-backed selection.")
+    return value.strip()
+
 
 class OpenAICompatibleClient:
     """Minimal adapter for llama.cpp server and compatible chat endpoints.
@@ -96,8 +125,10 @@ class OpenAICompatibleClient:
                 models.append(item["id"])
         return tuple(models)
 
-    def complete(self, model: str, messages: tuple[ChatMessage, ...]) -> str:
-        selected_model = model.strip()
+    def complete(
+        self, model: str | CatalogChatModel, messages: tuple[ChatMessage, ...]
+    ) -> str:
+        selected_model = _selected_model_name(model)
         if not selected_model:
             raise ValueError("Bitte zuerst ein Modell auswählen oder eintragen.")
         if not messages:
@@ -124,13 +155,15 @@ class OpenAICompatibleClient:
             raise ChatProviderError("Die Runtime lieferte eine leere Antwort.")
         return content.strip()
 
-    def complete_local(self, model: str, messages: tuple[ChatMessage, ...]) -> str:
+    def complete_local(
+        self, model: str | CatalogChatModel, messages: tuple[ChatMessage, ...]
+    ) -> str:
         """Complete one request with redirects and proxies disabled on loopback."""
         if not is_loopback_endpoint(self.endpoint):
             raise ChatProviderError(
                 "Lokale Workflow-Anfragen sind nur an einen Loopback-Endpunkt erlaubt."
             )
-        selected_model = model.strip()
+        selected_model = _selected_model_name(model)
         if not selected_model:
             raise ValueError("Bitte zuerst ein Modell auswählen oder eintragen.")
         if not messages:
@@ -160,7 +193,7 @@ class OpenAICompatibleClient:
 
     def stream_complete(
         self,
-        model: str,
+        model: str | CatalogChatModel,
         messages: tuple[ChatMessage, ...],
         on_delta: Callable[[str], None],
         cancel_event: threading.Event,
@@ -172,7 +205,7 @@ class OpenAICompatibleClient:
             raise ChatProviderError(
                 "Projektdateien dürfen ausschließlich an einen Loopbackserver gesendet werden."
             )
-        selected_model = model.strip()
+        selected_model = _selected_model_name(model)
         if not selected_model:
             raise ValueError("Bitte zuerst ein Modell auswählen oder eintragen.")
         if not messages:

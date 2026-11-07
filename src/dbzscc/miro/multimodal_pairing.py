@@ -9,11 +9,13 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from .discovery_pipeline import LocalDiscoveryArtifact
 from .gguf_metadata import GGUFMetadataDocument, GGUFMetadataField
+from .model_registry import ModelCatalogEntry
 
 
 @dataclass(frozen=True)
@@ -24,12 +26,24 @@ class MultimodalPairCandidate:
     modality: str
     model_artifact_id: str
     projector_artifact_id: str
+    model_metadata_sha256: str
+    projector_metadata_sha256: str
     model_path: str
     projector_path: str
     evidence: tuple[str, ...]
     status: str
     compatibility_status: str
     runtime_verified: bool = False
+
+
+@dataclass(frozen=True)
+class _PairInput:
+    artifact_id: str
+    path: str
+    metadata: Mapping[str, Any]
+    image_role: str
+    audio_role: str
+    metadata_sha256: str
 
 
 def pair_multimodal_candidates(
@@ -44,22 +58,67 @@ def pair_multimodal_candidates(
     labels are not compatibility links. File names and directory proximity are
     intentionally not consulted.
     """
-    image_models: list[LocalDiscoveryArtifact] = []
-    image_projectors: list[LocalDiscoveryArtifact] = []
-    audio_models: list[LocalDiscoveryArtifact] = []
-    audio_projectors: list[LocalDiscoveryArtifact] = []
-
+    inputs = []
     for item in artifacts:
         profile = item.capability_profile
         if profile is None or item.parse_result is None or item.parse_result.metadata is None:
             continue
-        if profile.image_role == "base_model_candidate":
+        if item.registry_record is None or not item.registry_record.metadata_prefix_sha256:
+            continue
+        inputs.append(
+            _PairInput(
+                artifact_id=item.candidate.artifact_id,
+                path=item.candidate.path,
+                metadata={
+                    field.key: field.value for field in item.parse_result.metadata.fields
+                },
+                image_role=profile.image_role,
+                audio_role=profile.audio_role,
+                metadata_sha256=item.registry_record.metadata_prefix_sha256,
+            )
+        )
+    return _pair_inputs(inputs)
+
+
+def pair_multimodal_catalog_entries(
+    entries: Iterable[ModelCatalogEntry],
+) -> tuple[MultimodalPairCandidate, ...]:
+    """Pair current persisted GGUF evidence across folders and scan pages."""
+    inputs = []
+    for entry in entries:
+        observation = entry.observation
+        if (
+            observation is None
+            or observation.status != "metadata_read"
+            or not observation.metadata_prefix_sha256
+        ):
+            continue
+        inputs.append(
+            _PairInput(
+                artifact_id=entry.artifact.artifact_id,
+                path=entry.artifact.path,
+                metadata=dict(entry.selected_metadata),
+                image_role=entry.image_role,
+                audio_role=entry.audio_role,
+                metadata_sha256=observation.metadata_prefix_sha256,
+            )
+        )
+    return _pair_inputs(inputs)
+
+
+def _pair_inputs(inputs: list[_PairInput]) -> tuple[MultimodalPairCandidate, ...]:
+    image_models: list[_PairInput] = []
+    image_projectors: list[_PairInput] = []
+    audio_models: list[_PairInput] = []
+    audio_projectors: list[_PairInput] = []
+    for item in inputs:
+        if item.image_role == "base_model_candidate":
             image_models.append(item)
-        elif profile.image_role == "projector_candidate":
+        elif item.image_role == "projector_candidate":
             image_projectors.append(item)
-        if profile.audio_role == "base_model_candidate":
+        if item.audio_role == "base_model_candidate":
             audio_models.append(item)
-        elif profile.audio_role == "projector_candidate":
+        elif item.audio_role == "projector_candidate":
             audio_projectors.append(item)
 
     pairs = []
@@ -78,28 +137,28 @@ def pair_multimodal_candidates(
 
 
 def _pair_group(
-    models: list[LocalDiscoveryArtifact],
-    projectors: list[LocalDiscoveryArtifact],
+    models: list[_PairInput],
+    projectors: list[_PairInput],
     modality: str,
 ) -> list[MultimodalPairCandidate]:
     result = []
     for model in models:
-        model_document = model.parse_result.metadata
-        model_architecture = _text_value(model_document, "general.architecture")
+        model_architecture = _text_value(model.metadata, "general.architecture")
         if not model_architecture:
             continue
         for projector in projectors:
-            projector_document = projector.parse_result.metadata
             evidence = _compatibility_evidence(
-                model_document, projector_document, model_architecture, modality
+                model.metadata, projector.metadata, model_architecture, modality
             )
             if not evidence:
                 continue
             pair_material = "\0".join(
                 (
                     modality,
-                    model.candidate.artifact_id,
-                    projector.candidate.artifact_id,
+                    model.artifact_id,
+                    projector.artifact_id,
+                    model.metadata_sha256,
+                    projector.metadata_sha256,
                     "|".join(evidence),
                 )
             )
@@ -112,10 +171,12 @@ def _pair_group(
                 MultimodalPairCandidate(
                     pair_id=pair_id,
                     modality=modality,
-                    model_artifact_id=model.candidate.artifact_id,
-                    projector_artifact_id=projector.candidate.artifact_id,
-                    model_path=model.candidate.path,
-                    projector_path=projector.candidate.path,
+                    model_artifact_id=model.artifact_id,
+                    projector_artifact_id=projector.artifact_id,
+                    model_metadata_sha256=model.metadata_sha256,
+                    projector_metadata_sha256=projector.metadata_sha256,
+                    model_path=model.path,
+                    projector_path=projector.path,
                     evidence=evidence,
                     status=(
                         "metadata_architecture_candidate"
@@ -133,8 +194,8 @@ def _pair_group(
 
 
 def _compatibility_evidence(
-    model: GGUFMetadataDocument,
-    projector: GGUFMetadataDocument,
+    model: Mapping[str, Any],
+    projector: Mapping[str, Any],
     model_architecture: str,
     modality: str,
 ) -> tuple[str, ...]:
@@ -166,11 +227,17 @@ def _compatibility_evidence(
     return tuple(sorted(set(evidence)))
 
 
-def _text_value(document: GGUFMetadataDocument, key: str) -> str | None:
-    field: GGUFMetadataField | None = document.field(key)
-    if field is None or field.type_name != "string" or not isinstance(field.value, str):
+def _text_value(document: Mapping[str, Any] | GGUFMetadataDocument, key: str) -> str | None:
+    if isinstance(document, Mapping):
+        value = document.get(key)
+    else:
+        field: GGUFMetadataField | None = document.field(key)
+        if field is None or field.type_name != "string":
+            return None
+        value = field.value
+    if not isinstance(value, str):
         return None
-    value = field.value.strip()
+    value = value.strip()
     return value or None
 
 

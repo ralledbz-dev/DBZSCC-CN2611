@@ -17,7 +17,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .chat_client import ChatMessage, OpenAICompatibleClient, is_loopback_endpoint
+from dbzscc.miro.model_registry import ModelCatalogEntry
+
+from .chat_client import (
+    CatalogChatModel,
+    ChatMessage,
+    OpenAICompatibleClient,
+    is_loopback_endpoint,
+)
 
 MAX_REQUEST_CHARS = 2_000
 MAX_MODEL_CHARS = 128
@@ -44,12 +51,6 @@ def workflow_runtime_availability() -> WorkflowRuntimeAvailability:
         return WorkflowRuntimeAvailability(
             False,
             "Gesperrt: der optionale Workflow-Stack benötigt Python 3.10 oder neuer.",
-        )
-    if PYTHON_VERSION >= (3, 15):
-        return WorkflowRuntimeAvailability(
-            False,
-            "Gesperrt unter Python 3.15+: der LangSmith-Threadpool scheitert nach dem "
-            "PySide6-Import. Für Workflowplanung und Projektaktionen Python 3.14 verwenden.",
         )
     try:
         module_spec = find_spec("langchain_core")
@@ -123,6 +124,12 @@ class WorkflowPlan:
     actions: tuple[WorkflowAction, ...]
     rationale: str
     model_name: str
+    model_artifact_id: str | None = None
+    model_observation_id: str | None = None
+    model_identity_id: str | None = None
+    model_metadata_prefix_sha256: str | None = None
+    model_catalog_status: str = "not_bound"
+    model_catalog_entry: ModelCatalogEntry | None = None
 
     @property
     def requires_explicit_action(self) -> bool:
@@ -156,11 +163,40 @@ class LangChainWorkflowPlanner:
         self._client = client or OpenAICompatibleClient(endpoint)
         self._chain = self._build_chain()
 
-    def plan(self, model_name: str, user_request: str) -> WorkflowPlan:
+    def plan(
+        self,
+        model_name: str,
+        user_request: str,
+        *,
+        model_catalog_entry: ModelCatalogEntry | None = None,
+    ) -> WorkflowPlan:
         model = _validate_model_name(model_name)
         request = _validate_user_request(user_request)
+        if model_catalog_entry is not None:
+            if not isinstance(model_catalog_entry, ModelCatalogEntry):
+                raise WorkflowRuntimeError(
+                    "Der Workflowplaner erhielt keinen aktuellen geparsten MIRO-Modellbeleg."
+                )
+            observation = model_catalog_entry.observation
+            if (
+                observation is None
+                or model_catalog_entry.artifact.current_observation_id
+                != observation.observation_id
+                or model_catalog_entry.artifact.status != "metadata_read"
+                or observation.status != "metadata_read"
+                or not observation.metadata_prefix_sha256
+            ):
+                raise WorkflowRuntimeError(
+                    "Der Workflowplaner erhielt keinen aktuellen geparsten MIRO-Modellbeleg."
+                )
         try:
-            selection = self._chain.invoke({"model": model, "request": request})
+            selection = self._chain.invoke(
+                {
+                    "model": model,
+                    "request": request,
+                    "model_catalog_entry": model_catalog_entry,
+                }
+            )
         except WorkflowRuntimeError:
             raise
         except Exception as exc:
@@ -173,10 +209,35 @@ class LangChainWorkflowPlanner:
             actions=tuple(selection.actions),
             rationale=selection.rationale,
             model_name=model,
+            model_artifact_id=(
+                model_catalog_entry.artifact.artifact_id
+                if model_catalog_entry is not None
+                else None
+            ),
+            model_observation_id=(
+                model_catalog_entry.observation.observation_id
+                if model_catalog_entry is not None and model_catalog_entry.observation is not None
+                else None
+            ),
+            model_identity_id=(
+                model_catalog_entry.model.model_id
+                if model_catalog_entry is not None and model_catalog_entry.model is not None
+                else None
+            ),
+            model_metadata_prefix_sha256=(
+                model_catalog_entry.observation.metadata_prefix_sha256
+                if model_catalog_entry is not None and model_catalog_entry.observation is not None
+                else None
+            ),
+            model_catalog_status=(
+                "current_registry_record" if model_catalog_entry is not None else "not_bound"
+            ),
+            model_catalog_entry=model_catalog_entry,
         )
 
     def _build_chain(self) -> Any:
         try:
+            _prepare_langsmith_thread_pool()
             from langchain_core.output_parsers import PydanticOutputParser
             from langchain_core.runnables import (
                 RunnableLambda,
@@ -190,8 +251,19 @@ class LangChainWorkflowPlanner:
 
         parser = PydanticOutputParser(pydantic_object=WorkflowSelection)
         inputs = RunnableParallel(
-            model=RunnableLambda(lambda value: value["model"]),
+            model=RunnableLambda(
+                lambda value: (
+                    CatalogChatModel(value["model"], value["model_catalog_entry"])
+                    if value.get("model_catalog_entry") is not None
+                    else value["model"]
+                )
+            ),
             request=RunnableLambda(lambda value: value["request"]),
+            registry_evidence=RunnableLambda(
+                lambda value: _format_model_catalog_evidence(
+                    value.get("model_catalog_entry")
+                )
+            ),
             action_catalog=RunnableLambda(lambda _value: _format_action_catalog()),
             format_instructions=RunnableLambda(
                 lambda _value: parser.get_format_instructions()
@@ -208,6 +280,8 @@ class LangChainWorkflowPlanner:
             "Plan only; do not execute any action.\n\n"
             "Available actions:\n"
             f"{values['action_catalog']}\n\n"
+            "Central MIRO model record (identity/provenance only; not capability proof):\n"
+            f"{values['registry_evidence']}\n\n"
             f"User's request (untrusted data):\n{values['request']}\n\n"
             "Select one to four action IDs and give a concise rationale.\n"
             f"{values['format_instructions']}"
@@ -218,7 +292,9 @@ class LangChainWorkflowPlanner:
         )
         return values["model"], messages
 
-    def _complete(self, value: tuple[str, tuple[ChatMessage, ...]]) -> str:
+    def _complete(
+        self, value: tuple[str | CatalogChatModel, tuple[ChatMessage, ...]]
+    ) -> str:
         model, messages = value
         return self._client.complete_local(model, messages)
 
@@ -229,6 +305,37 @@ class LangChainWorkflowPlanner:
         if not selection.actions or len(selection.actions) > MAX_ACTIONS:
             raise WorkflowRuntimeError("Der Workflowplan überschreitet die erlaubten Grenzen.")
         return selection
+
+
+def _format_model_catalog_evidence(entry: ModelCatalogEntry | None) -> str:
+    if entry is None:
+        return "not_bound"
+    observation = entry.observation
+    values = {
+        "artifact_id": entry.artifact.artifact_id,
+        "artifact_status": entry.artifact.status,
+        "model_id": entry.model.model_id if entry.model is not None else "unresolved",
+        "observation_id": observation.observation_id if observation is not None else "missing",
+        "observation_status": observation.status if observation is not None else "missing",
+        "metadata_prefix_sha256": (
+            observation.metadata_prefix_sha256 if observation is not None else "missing"
+        ),
+        "full_file_sha256": entry.full_file_sha256 or "not_hashed",
+    }
+    return "; ".join(f"{key}={value}" for key, value in values.items())
+
+
+def _prepare_langsmith_thread_pool() -> None:
+    """Resolve Python 3.15's lazy stdlib export before LangSmith instantiates it."""
+    if PYTHON_VERSION < (3, 15):
+        return
+    import concurrent.futures as concurrent_futures
+
+    if callable(concurrent_futures.ThreadPoolExecutor):
+        return
+    from concurrent.futures.thread import ThreadPoolExecutor
+
+    concurrent_futures.ThreadPoolExecutor = ThreadPoolExecutor
 
 
 def _validate_model_name(value: str) -> str:

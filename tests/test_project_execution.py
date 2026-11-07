@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,7 @@ from dbzscc.app.project_execution import (
 from dbzscc.app.resource_orchestrator import ResourceSnapshot, TelemetryQuality
 from dbzscc.app.toolchain_runtime import OneShotState
 from dbzscc.app.workflow_runtime import WorkflowAction, WorkflowPlan
+from dbzscc.miro.model_registry import ModelCatalogEntry
 
 
 class _ResourceMonitor:
@@ -97,11 +99,34 @@ def python_project(tmp_path: Path) -> tuple[Path, Path]:
     return root, python
 
 
+def _catalog_entry() -> ModelCatalogEntry:
+    observation = SimpleNamespace(observation_id="observation-1", status="metadata_read")
+    artifact = SimpleNamespace(
+        artifact_id="artifact-1",
+        current_observation_id=observation.observation_id,
+        status="metadata_read",
+    )
+    return ModelCatalogEntry(
+        artifact=artifact,
+        model=None,
+        observation=observation,
+        selected_metadata=(),
+        capability_evidence_json="{}",
+        runtime_qualifications=(),
+        multimodal_pairings=(),
+    )
+
+
 def _plan() -> WorkflowPlan:
+    entry = _catalog_entry()
     return WorkflowPlan(
         actions=(WorkflowAction.RUN_TESTS, WorkflowAction.RUN_LINTER, WorkflowAction.PROPOSE_PATCH),
         rationale="Prüfe Tests und Linter vor einem gezielten Vorschlag.",
         model_name="local-model",
+        model_artifact_id=entry.artifact.artifact_id,
+        model_observation_id=entry.observation.observation_id,
+        model_catalog_status="current_registry_record",
+        model_catalog_entry=entry,
     )
 
 
@@ -130,14 +155,16 @@ def test_default_python_prefers_isolated_workflow_environment(python_project) ->
 def test_plan_builds_fixed_typed_pytest_and_ruff_invocations(python_project) -> None:
     root, python = python_project
     service = _service()
+    workflow_plan = _plan()
 
     plans = service.prepare(
-        _plan(),
+        workflow_plan,
         (WorkflowAction.RUN_TESTS, WorkflowAction.RUN_LINTER),
         project_root=root,
         python_executable=python,
         conversation_id="chat-1",
         workflow_id="workflow-1",
+        run_id="persistent-workflow-run",
     )
 
     assert [plan.action for plan in plans] == [ProjectOperation.TESTS, ProjectOperation.LINTER]
@@ -149,8 +176,69 @@ def test_plan_builds_fixed_typed_pytest_and_ruff_invocations(python_project) -> 
     )
     assert all(plan.invocation.working_directory == root for plan in plans)
     assert all(plan.resource_plan.admitted for plan in plans)
+    assert all(
+        plan.model_catalog_entry is workflow_plan.model_catalog_entry for plan in plans
+    )
     assert all(plan.project_fingerprint == plans[0].project_fingerprint for plan in plans)
-    assert plans[0].run_id != plans[1].run_id
+    assert plans[0].run_id == plans[1].run_id == "persistent-workflow-run"
+    assert plans[0].invocation.invocation_id != plans[1].invocation.invocation_id
+
+
+def test_pipeline_targets_follow_validated_pyproject_manifest(python_project) -> None:
+    root, python = python_project
+    (root / "tests" / "unit").mkdir()
+    (root / "tests" / "unit" / "test_smoke.py").write_text(
+        "def test_smoke(): assert True\n", encoding="utf-8"
+    )
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "fixture"\n'
+        '[tool.pytest.ini_options]\ntestpaths = ["tests/unit"]\n'
+        '[tool.dbzscc.execution]\npytest_paths = ["tests/unit"]\n'
+        'ruff_paths = ["src/module.py"]\n',
+        encoding="utf-8",
+    )
+
+    plans = _service().prepare(
+        _plan(),
+        (WorkflowAction.RUN_TESTS, WorkflowAction.RUN_LINTER),
+        project_root=root,
+        python_executable=python,
+        conversation_id="chat-manifest",
+        workflow_id="workflow-manifest",
+        run_id="manifest-run",
+    )
+
+    assert plans[0].invocation.argv[-1] == "tests/unit"
+    assert plans[1].invocation.argv[-1] == "src/module.py"
+    assert plans[0].run_id == plans[1].run_id == "manifest-run"
+
+
+@pytest.mark.parametrize(
+    ("execution_table", "message"),
+    [
+        ('pytest_paths = ["../outside"]\n', "sichere relative Pfade"),
+        ('command = ["python", "-c", "arbitrary"]\n', "Nicht unterstützte"),
+        ('ruff_paths = [".venv/Scripts"]\n', "sichere relative Pfade"),
+    ],
+)
+def test_pipeline_manifest_rejects_unsafe_targets_and_commands(
+    python_project, execution_table: str, message: str
+) -> None:
+    root, python = python_project
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "fixture"\n[tool.dbzscc.execution]\n' + execution_table,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProjectExecutionError, match=message):
+        _service().prepare(
+            _plan(),
+            (WorkflowAction.RUN_TESTS,),
+            project_root=root,
+            python_executable=python,
+            conversation_id="chat-manifest",
+            workflow_id="workflow-manifest",
+        )
 
 
 def test_prepare_rejects_actions_not_in_plan_and_unsupported_server_action(python_project) -> None:
@@ -238,10 +326,14 @@ def test_execute_streams_redacted_output_and_records_exit_evidence(python_projec
     assert "[redacted]" in result.output_summary
     assert any(event.event_type is ExecutionEventType.STDOUT for event in events)
     assert any(event.event_type is ExecutionEventType.STDERR for event in events)
+    assert all(event.run_id == plan.run_id for event in events)
+    assert all(event.step_id == "run_tests" for event in events)
+    assert all(event.provenance[2] == ("project_fingerprint", plan.project_fingerprint) for event in events)
     exit_event = next(event for event in events if event.event_type is ExecutionEventType.EXIT_CODE)
     assert exit_event.run_id == plan.run_id
     assert exit_event.workflow_id == plan.workflow_id
     assert exit_event.exit_code == 0
+    assert exit_event.state == "succeeded"
     assert exit_event.provenance[0] == ("action", "run_tests")
     assert guard.closed
 

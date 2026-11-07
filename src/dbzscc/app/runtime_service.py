@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import hashlib
 import math
 import os
+import platform
 import re
 import shutil
 import socket
@@ -19,6 +21,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 from http.client import HTTPConnection
 from pathlib import Path
@@ -154,6 +157,12 @@ class RuntimeLaunchPlan:
     context_tokens: int
     requested_threads: int
     port: int
+    model_artifact_id: str | None = None
+    model_observation_id: str | None = None
+    model_full_file_sha256: str | None = None
+    runtime_build_sha256: str | None = None
+    device_physical_id: str | None = None
+    runtime_parameters: tuple[tuple[str, str | int], ...] = ()
 
     @property
     def admitted(self) -> bool:
@@ -330,6 +339,8 @@ class RuntimeController:
         resource_monitor: object | None = None,
         orchestrator: ResourceOrchestrator | None = None,
         health_probe: Callable[[str, float], bool] | None = None,
+        catalog_lookup: Callable[[str | os.PathLike[str]], object | None] | None = None,
+        full_hash_lookup: Callable[[str, str], str] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -338,6 +349,8 @@ class RuntimeController:
         self._orchestrator = orchestrator or ResourceOrchestrator()
         self._event_sink = event_sink or (lambda _event: None)
         self._health_probe = health_probe or _probe_health
+        self._catalog_lookup = catalog_lookup
+        self._full_hash_lookup = full_hash_lookup
         self._sleep = sleep
         self._monotonic = monotonic
         self._lock = threading.RLock()
@@ -440,6 +453,7 @@ class RuntimeController:
                 "Ressourcen-Vorprüfung abgelehnt; kein llama-server wurde gestartet. "
                 + (details or "")
             )
+        self._verify_selected_model_hash(plan)
         self._ensure_port_available(plan)
         endpoint = f"http://127.0.0.1:{port}/v1"
         server = plan.runtime_directory / "llama-server.exe"
@@ -637,6 +651,55 @@ class RuntimeController:
             raise RuntimeWorkflowError("Der lokale Port liegt außerhalb des gültigen Bereichs.")
         root = _validate_model_root(model_root)
         model = _validate_model_file(root, model_path)
+        catalog_entry = None
+        model_full_file_sha256 = None
+        if self._catalog_lookup is not None:
+            try:
+                catalog_entry = self._catalog_lookup(model)
+            except Exception as exc:
+                raise RuntimeWorkflowError(
+                    "Der zentrale Modellkatalog konnte nicht geprüft werden; kein Prozess wurde gestartet."
+                ) from exc
+            if not isinstance(catalog_entry, ModelCatalogEntry):
+                raise RuntimeWorkflowError(
+                    "Der zentrale Modellkatalog lieferte keinen typisierten ModelCatalogEntry."
+                )
+            artifact = getattr(catalog_entry, "artifact", None)
+            observation = getattr(catalog_entry, "observation", None)
+            current_stat = model.stat()
+            current_mtime = (
+                datetime.fromtimestamp(current_stat.st_mtime, timezone.utc)
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z")
+            )
+            if (
+                artifact is None
+                or observation is None
+                or artifact.status != "metadata_read"
+                or observation.status != "metadata_read"
+                or artifact.current_observation_id != observation.observation_id
+                or os.path.normcase(os.path.abspath(artifact.path))
+                != os.path.normcase(os.path.abspath(model))
+                or artifact.file_size_bytes != current_stat.st_size
+                or artifact.file_modified_at_utc != current_mtime
+            ):
+                raise RuntimeWorkflowError(
+                    "Die ausgewählte GGUF-Datei hat keinen aktuellen, geparsten Eintrag im zentralen Modellkatalog."
+                )
+            artifact_id = getattr(artifact, "artifact_id", None)
+            observation_id = getattr(observation, "observation_id", None)
+            if not isinstance(artifact_id, str) or not isinstance(observation_id, str):
+                raise RuntimeWorkflowError("Der Registry-Eintrag besitzt keine stabile Artefakt-/Beobachtungs-ID.")
+            if self._full_hash_lookup is None:
+                raise RuntimeWorkflowError("Der On-demand-Vollhash-Dienst des Modellkatalogs ist nicht verbunden.")
+            try:
+                model_full_file_sha256 = self._full_hash_lookup(artifact_id, observation_id)
+            except Exception as exc:
+                raise RuntimeWorkflowError(
+                    "Die ausgewählte GGUF-Datei wurde beim Vollhash-Preflight geändert oder konnte nicht geprüft werden."
+                ) from exc
+            if not _is_sha256(model_full_file_sha256):
+                raise RuntimeWorkflowError("Der zentrale Katalog lieferte keinen gültigen GGUF-Vollhash.")
         runtime_directory = (APP_ROOT / "runtimes" / "llama.cpp" / _RUNTIME_FOLDERS[backend]).resolve()
         cli = runtime_directory / "llama-cli.exe"
         if not cli.is_file():
@@ -710,11 +773,19 @@ class RuntimeController:
             devices=devices,
             backends=(capability,),
         )
-        size_mib = max(1, math.ceil(model.stat().st_size / MIB))
+        model_size_bytes = (
+            catalog_entry.artifact.file_size_bytes
+            if catalog_entry is not None
+            else model.stat().st_size
+        )
+        size_mib = max(1, math.ceil(model_size_bytes / MIB))
         kv_mib = _estimate_kv_cache_mib(model, context_tokens)
         request = WorkloadRequest(
             workload_id=f"llama-server-{run_id}",
-            model_id=model.name,
+            model_id=(
+                getattr(getattr(catalog_entry, "model", None), "model_id", None)
+                or model.name
+            ),
             backend_preferences=(backend,),
             model_file_size_mib=size_mib,
             kv_cache_mib=kv_mib,
@@ -722,6 +793,7 @@ class RuntimeController:
             cpu_threads=cpu_threads,
             min_cpu_threads=1,
             allow_cpu_thread_reduction=True,
+            model_catalog_entry=catalog_entry,
         )
         plan = self._orchestrator.plan(request, snapshot, now_monotonic_s=now)
         target_name = target_names.get(plan.backend_target_id or "", "CPU")
@@ -739,6 +811,30 @@ class RuntimeController:
             context_tokens=context_tokens,
             requested_threads=cpu_threads,
             port=port,
+            model_artifact_id=getattr(
+                getattr(catalog_entry, "artifact", None), "artifact_id", None
+            ),
+            model_observation_id=getattr(
+                getattr(catalog_entry, "observation", None), "observation_id", None
+            ),
+            model_full_file_sha256=model_full_file_sha256,
+            runtime_build_sha256=_sha256_file(runtime_directory / "llama-server.exe"),
+            device_physical_id=(
+                plan.physical_id
+                or f"cpu:{platform.machine()}:{platform.processor() or 'unknown'}"
+            ),
+            runtime_parameters=tuple(
+                sorted(
+                    {
+                        "backend": backend.value,
+                        "context_tokens": context_tokens,
+                        "cpu_threads": plan.cpu_threads,
+                        "gpu_layers": 0 if backend is Backend.CPU else 99,
+                        "port": port,
+                        "target_id": plan.backend_target_id or "cpu",
+                    }.items()
+                )
+            ),
         )
         if plan.status is PlanStatus.REJECTED:
             details = "; ".join(plan.fail_closed_reasons)
@@ -767,6 +863,24 @@ class RuntimeController:
             source="resource-orchestrator",
         )
         return launch_plan
+
+    def _verify_selected_model_hash(self, plan: RuntimeLaunchPlan) -> None:
+        if plan.model_artifact_id is None:
+            return
+        if self._full_hash_lookup is None or plan.model_observation_id is None:
+            raise RuntimeWorkflowError("Der ausgewählte Modell-Vollhash kann vor dem Start nicht erneut geprüft werden.")
+        try:
+            current_hash = self._full_hash_lookup(
+                plan.model_artifact_id, plan.model_observation_id
+            )
+        except Exception as exc:
+            raise RuntimeWorkflowError(
+                "Das ausgewählte Modell änderte sich nach der Ressourcenprüfung; der Start wurde abgebrochen."
+            ) from exc
+        if current_hash != plan.model_full_file_sha256:
+            raise RuntimeWorkflowError(
+                "Der vollständige GGUF-Hash änderte sich nach der Ressourcenprüfung; der Start wurde abgebrochen."
+            )
 
     def _ensure_port_available(self, plan: RuntimeLaunchPlan) -> None:
         try:
@@ -1036,8 +1150,21 @@ def _validate_model_file(root: Path, value: str | os.PathLike[str]) -> Path:
         raise
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise RuntimeWorkflowError("Die ausgewählte Modelldatei ist nicht verfügbar.") from exc
-    if model.parent != root or model.suffix.casefold() != ".gguf":
-        raise RuntimeWorkflowError("Nur eine direkt im ausgewählten Ordner liegende GGUF-Datei ist zulässig.")
+    try:
+        model.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeWorkflowError("Die GGUF-Datei liegt außerhalb des ausgewählten Modellroots.") from exc
+    if model == root or model.suffix.casefold() != ".gguf":
+        raise RuntimeWorkflowError("Nur eine GGUF-Datei innerhalb des ausgewählten Modellroots ist zulässig.")
+    parent = model.parent
+    while parent != root:
+        try:
+            info = parent.lstat()
+        except OSError as exc:
+            raise RuntimeWorkflowError("Ein Modell-Unterordner ist nicht mehr verfügbar.") from exc
+        if parent.is_symlink() or _is_reparse_point(getattr(info, "st_file_attributes", 0)):
+            raise RuntimeWorkflowError("Modell-Unterordner dürfen keine Symlinks oder Reparse-Points sein.")
+        parent = parent.parent
     if not model.is_file():
         raise RuntimeWorkflowError("Die ausgewählte Modelldatei ist kein reguläres, unverlinktes File.")
     return model
@@ -1128,6 +1255,25 @@ def _estimate_kv_cache_mib(model_path: Path, context_tokens: int) -> int | None:
     return max(1, math.ceil(estimated_bytes * 1.25 / MIB))
 
 
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
 def _child_environment(runtime_directory: Path) -> dict[str, str]:
     """Build a child-only DLL search path and omit secret-looking environment keys."""
     allowed_names = {
@@ -1193,3 +1339,4 @@ def _event_plan_context(
         requested_threads=0,
         port=0,
     )
+from dbzscc.miro.model_registry import ModelCatalogEntry

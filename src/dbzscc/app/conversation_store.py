@@ -171,6 +171,28 @@ class ConversationStore:
             )
         return message
 
+    def get_message(self, message_id: str) -> StoredMessage | None:
+        """Read back one persisted message by its stable identifier."""
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT message_id, conversation_id, role, content, created_at,
+                          metadata_json
+                   FROM messages WHERE message_id = ?""",
+                (message_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw_metadata = json.loads(row[5])
+            metadata = (
+                tuple(sorted(_clean_message_metadata(raw_metadata).items()))
+                if isinstance(raw_metadata, dict)
+                else ()
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = ()
+        return StoredMessage(*row[:5], metadata)
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         with closing(sqlite3.connect(self.database_path, timeout=5.0)) as connection:
@@ -191,6 +213,7 @@ _MESSAGE_METADATA_KEYS = frozenset(
     {
         "run_id",
         "runtime_run_id",
+        "runtime_build_sha256",
         "model",
         "backend",
         "port",
@@ -201,6 +224,11 @@ _MESSAGE_METADATA_KEYS = frozenset(
         "accelerator_memory_mib",
         "cpu_threads",
         "endpoint_binding",
+        "model_artifact_id",
+        "model_observation_id",
+        "model_id",
+        "metadata_prefix_sha256",
+        "model_full_file_sha256",
     }
 )
 

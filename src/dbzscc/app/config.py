@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 DEFAULT_MODEL_ENDPOINT = "http://127.0.0.1:8080/v1"
+DEFAULT_MODEL_ROOT = r"D:\Models"
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,15 @@ htmlcov/
 dist/
 build/
 media/
+/.dbzs/
+/.work/
+/.tmp/
+/models/stt/
+/models/rag/
+/runtimes/
+/outputs/
+/screenshots/
+/doc/UI EXAMPLES/
 .dbzs/*.db
 .dbzs/*.sqlite
 .dbzs/*.sqlite3

@@ -13,6 +13,10 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dbzscc.miro.model_registry import ModelCatalogEntry
 
 
 class Backend(str, Enum):
@@ -147,6 +151,7 @@ class WorkloadRequest:
     cpu_threads: int = 4
     min_cpu_threads: int = 1
     allow_cpu_thread_reduction: bool = True
+    model_catalog_entry: ModelCatalogEntry | None = None
 
     def __post_init__(self) -> None:
         if not self.workload_id.strip() or not self.model_id.strip():
@@ -157,6 +162,20 @@ class WorkloadRequest:
             raise ValueError("CPU thread counts must be positive")
         if self.min_cpu_threads > self.cpu_threads:
             raise ValueError("min_cpu_threads cannot exceed cpu_threads")
+        if self.model_catalog_entry is not None:
+            from dbzscc.miro.model_registry import ModelCatalogEntry
+
+            if not isinstance(self.model_catalog_entry, ModelCatalogEntry):
+                raise ValueError("model_catalog_entry must be a current parsed registry record")
+            artifact = self.model_catalog_entry.artifact
+            observation = self.model_catalog_entry.observation
+            if (
+                observation is None
+                or artifact.status != "metadata_read"
+                or observation.status != "metadata_read"
+                or artifact.current_observation_id != observation.observation_id
+            ):
+                raise ValueError("model_catalog_entry must be a current parsed registry record")
         for name in (
             "model_file_size_mib",
             "estimated_weight_mib",

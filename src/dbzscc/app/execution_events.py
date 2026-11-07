@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import ClassVar
 
 
 class ExecutionEventType(str, Enum):
@@ -42,6 +43,54 @@ class ExecutionEventType(str, Enum):
     TRUNCATED = "truncated"
 
 
+class ExecutionRunState(str, Enum):
+    """Persisted lifecycle states for one end-to-end project run."""
+
+    CREATED = "created"
+    RUNNING = "running"
+    DIAGNOSING = "diagnosing"
+    PROPOSING_PATCH = "proposing_patch"
+    AWAITING_PATCH_REVIEW = "awaiting_patch_review"
+    PATCH_APPLIED = "patch_applied"
+    RETESTING = "retesting"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+    STOPPED = "stopped"
+
+
+@dataclass(frozen=True)
+class ExecutionRunRecord:
+    """Private local binding for every event and step in one project run."""
+
+    conversation_id: str
+    workflow_id: str
+    run_id: str
+    project_root: str
+    project_fingerprint: str
+    model_artifact_id: str | None = None
+    model_observation_id: str | None = None
+    model_identity_id: str | None = None
+    model_metadata_prefix_sha256: str | None = None
+    state: ExecutionRunState = ExecutionRunState.CREATED
+    iteration: int = 0
+    stop_reason: str | None = None
+    updated_at_utc: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    )
+
+    def __post_init__(self) -> None:
+        if not self.conversation_id.strip() or not self.workflow_id.strip() or not self.run_id.strip():
+            raise ValueError("conversation_id, workflow_id and run_id must not be empty")
+        if not self.project_root.strip() or not self.project_fingerprint.strip():
+            raise ValueError("project_root and project_fingerprint must not be empty")
+        if not isinstance(self.state, ExecutionRunState):
+            raise TypeError("state must be an ExecutionRunState")
+        if type(self.iteration) is not int or self.iteration < 0:
+            raise ValueError("iteration must be a non-negative integer")
+
+
 @dataclass(frozen=True)
 class ExecutionEvent:
     """One user-readable event, correlated with a conversation and workflow."""
@@ -54,6 +103,8 @@ class ExecutionEvent:
     source: str = "runtime"
     exit_code: int | None = None
     provenance: tuple[tuple[str, str], ...] = ()
+    state: str | None = None
+    step_id: str | None = None
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at_utc: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -68,6 +119,10 @@ class ExecutionEvent:
             raise TypeError("event_type must be an ExecutionEventType")
         if not isinstance(self.text, str):
             raise TypeError("event text must be text")
+        if self.state is not None and (not isinstance(self.state, str) or not self.state.strip()):
+            raise ValueError("state must be non-empty text when provided")
+        if self.step_id is not None and (not isinstance(self.step_id, str) or not self.step_id.strip()):
+            raise ValueError("step_id must be non-empty text when provided")
 
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _SECRET_ASSIGNMENT = re.compile(
@@ -131,6 +186,40 @@ class ExecutionEventStore:
     MAX_EVENT_CHARS = 1200
     MAX_EVENTS_PER_RUN = 180
     MAX_EVENTS_PER_CONVERSATION = 1600
+    _ALLOWED_TRANSITIONS: ClassVar[
+        dict[ExecutionRunState, frozenset[ExecutionRunState]]
+    ] = {
+        ExecutionRunState.CREATED: frozenset({
+            ExecutionRunState.RUNNING, ExecutionRunState.CANCELLED,
+            ExecutionRunState.FAILED, ExecutionRunState.STOPPED,
+        }),
+        ExecutionRunState.RUNNING: frozenset({
+            ExecutionRunState.DIAGNOSING, ExecutionRunState.SUCCEEDED,
+            ExecutionRunState.FAILED, ExecutionRunState.CANCELLED,
+            ExecutionRunState.TIMED_OUT, ExecutionRunState.STOPPED,
+        }),
+        ExecutionRunState.DIAGNOSING: frozenset({
+            ExecutionRunState.PROPOSING_PATCH, ExecutionRunState.FAILED,
+            ExecutionRunState.CANCELLED, ExecutionRunState.STOPPED,
+        }),
+        ExecutionRunState.PROPOSING_PATCH: frozenset({
+            ExecutionRunState.AWAITING_PATCH_REVIEW, ExecutionRunState.CANCELLED,
+            ExecutionRunState.FAILED, ExecutionRunState.STOPPED,
+        }),
+        ExecutionRunState.AWAITING_PATCH_REVIEW: frozenset({
+            ExecutionRunState.PATCH_APPLIED, ExecutionRunState.CANCELLED,
+            ExecutionRunState.STOPPED,
+        }),
+        ExecutionRunState.PATCH_APPLIED: frozenset({
+            ExecutionRunState.RETESTING, ExecutionRunState.FAILED,
+            ExecutionRunState.CANCELLED, ExecutionRunState.STOPPED,
+        }),
+        ExecutionRunState.RETESTING: frozenset({
+            ExecutionRunState.SUCCEEDED, ExecutionRunState.DIAGNOSING,
+            ExecutionRunState.FAILED, ExecutionRunState.CANCELLED,
+            ExecutionRunState.TIMED_OUT, ExecutionRunState.STOPPED,
+        }),
+    }
 
     def __init__(self, database_path: str | os.PathLike[str]) -> None:
         self.path = Path(database_path)
@@ -142,6 +231,131 @@ class ExecutionEventStore:
         connection = sqlite3.connect(self.path, timeout=5.0)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def bind_run(self, record: ExecutionRunRecord) -> ExecutionRunRecord:
+        """Create or refresh a run's project fingerprint without resetting its state."""
+        if not isinstance(record, ExecutionRunRecord):
+            raise TypeError("record must be an ExecutionRunRecord")
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_runs WHERE run_id = ?", (record.run_id,)
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """INSERT INTO execution_runs (
+                        conversation_id, workflow_id, run_id, project_root,
+                        project_fingerprint, model_artifact_id, model_observation_id,
+                        model_identity_id, model_metadata_prefix_sha256, state,
+                        iteration, stop_reason, updated_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    self._run_values(record),
+                )
+                return record
+            existing = self._run_from_row(row)
+            identity = (
+                existing.conversation_id, existing.workflow_id, existing.project_root,
+                existing.model_artifact_id, existing.model_observation_id,
+                existing.model_identity_id, existing.model_metadata_prefix_sha256,
+            )
+            expected = (
+                record.conversation_id, record.workflow_id, record.project_root,
+                record.model_artifact_id, record.model_observation_id,
+                record.model_identity_id, record.model_metadata_prefix_sha256,
+            )
+            if identity != expected:
+                raise ValueError("run_id is already bound to a different project or model record")
+            connection.execute(
+                "UPDATE execution_runs SET project_fingerprint = ?, updated_at_utc = ? "
+                "WHERE run_id = ?",
+                (record.project_fingerprint, record.updated_at_utc, record.run_id),
+            )
+            return ExecutionRunRecord(
+                **{
+                    **existing.__dict__,
+                    "project_fingerprint": record.project_fingerprint,
+                    "updated_at_utc": record.updated_at_utc,
+                }
+            )
+
+    def get_run(self, run_id: str) -> ExecutionRunRecord | None:
+        if not run_id.strip():
+            return None
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return self._run_from_row(row) if row is not None else None
+
+    def transition_run(
+        self,
+        run_id: str,
+        state: ExecutionRunState,
+        *,
+        iteration: int | None = None,
+        stop_reason: str | None = None,
+    ) -> ExecutionRunRecord:
+        """Persist one checked lifecycle transition; repeated same-state updates are idempotent."""
+        if not isinstance(state, ExecutionRunState):
+            raise TypeError("state must be an ExecutionRunState")
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("run_id is not bound to a project execution")
+            current = self._run_from_row(row)
+            if state is not current.state and state not in self._ALLOWED_TRANSITIONS.get(
+                current.state, frozenset()
+            ):
+                raise ValueError(f"invalid run-state transition: {current.state.value} -> {state.value}")
+            next_iteration = current.iteration if iteration is None else iteration
+            if type(next_iteration) is not int or next_iteration < current.iteration:
+                raise ValueError("run iteration cannot move backwards")
+            safe_reason = redact_text(stop_reason, max_chars=240) if stop_reason else None
+            updated = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            connection.execute(
+                "UPDATE execution_runs SET state = ?, iteration = ?, stop_reason = ?, "
+                "updated_at_utc = ? WHERE run_id = ?",
+                (state.value, next_iteration, safe_reason, updated, run_id),
+            )
+            return ExecutionRunRecord(
+                **{
+                    **current.__dict__,
+                    "state": state,
+                    "iteration": next_iteration,
+                    "stop_reason": safe_reason,
+                    "updated_at_utc": updated,
+                }
+            )
+
+    @staticmethod
+    def _run_values(record: ExecutionRunRecord) -> tuple[object, ...]:
+        return (
+            record.conversation_id, record.workflow_id, record.run_id,
+            record.project_root, record.project_fingerprint,
+            record.model_artifact_id, record.model_observation_id,
+            record.model_identity_id, record.model_metadata_prefix_sha256,
+            record.state.value, record.iteration, record.stop_reason,
+            record.updated_at_utc,
+        )
+
+    @staticmethod
+    def _run_from_row(row: sqlite3.Row) -> ExecutionRunRecord:
+        return ExecutionRunRecord(
+            conversation_id=row["conversation_id"],
+            workflow_id=row["workflow_id"],
+            run_id=row["run_id"],
+            project_root=row["project_root"],
+            project_fingerprint=row["project_fingerprint"],
+            model_artifact_id=row["model_artifact_id"],
+            model_observation_id=row["model_observation_id"],
+            model_identity_id=row["model_identity_id"],
+            model_metadata_prefix_sha256=row["model_metadata_prefix_sha256"],
+            state=ExecutionRunState(row["state"]),
+            iteration=int(row["iteration"]),
+            stop_reason=row["stop_reason"],
+            updated_at_utc=row["updated_at_utc"],
+        )
 
     def _initialize(self) -> None:
         with self._lock, self._connect() as connection:
@@ -157,8 +371,36 @@ class ExecutionEventStore:
                     source TEXT NOT NULL,
                     text TEXT NOT NULL,
                     exit_code INTEGER,
-                    provenance_json TEXT NOT NULL
+                    provenance_json TEXT NOT NULL,
+                    state TEXT,
+                    step_id TEXT
                 )"""
+            )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(execution_events)")}
+            if "state" not in columns:
+                connection.execute("ALTER TABLE execution_events ADD COLUMN state TEXT")
+            if "step_id" not in columns:
+                connection.execute("ALTER TABLE execution_events ADD COLUMN step_id TEXT")
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS execution_runs (
+                    conversation_id TEXT NOT NULL,
+                    workflow_id TEXT NOT NULL,
+                    run_id TEXT PRIMARY KEY,
+                    project_root TEXT NOT NULL,
+                    project_fingerprint TEXT NOT NULL,
+                    model_artifact_id TEXT,
+                    model_observation_id TEXT,
+                    model_identity_id TEXT,
+                    model_metadata_prefix_sha256 TEXT,
+                    state TEXT NOT NULL,
+                    iteration INTEGER NOT NULL,
+                    stop_reason TEXT,
+                    updated_at_utc TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_execution_runs_conversation "
+                "ON execution_runs(conversation_id, updated_at_utc)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_execution_events_conversation "
@@ -186,6 +428,8 @@ class ExecutionEventStore:
             source=safe_source,
             exit_code=event.exit_code,
             provenance=safe_provenance,
+            state=event.state,
+            step_id=redact_text(event.step_id, max_chars=120) if event.step_id else None,
             event_id=event.event_id,
             created_at_utc=event.created_at_utc,
         )
@@ -217,6 +461,8 @@ class ExecutionEventStore:
                         text="Ältere Ausgaben dieses Laufs wurden wegen des Größenlimits gekürzt.",
                         source="execution-event-store",
                         provenance=safe_event.provenance,
+                        state=safe_event.state,
+                        step_id=safe_event.step_id,
                     )
                     self._insert(connection, marker)
                 else:
@@ -246,8 +492,8 @@ class ExecutionEventStore:
         connection.execute(
             """INSERT OR IGNORE INTO execution_events (
                 event_id, conversation_id, workflow_id, run_id, created_at_utc,
-                event_type, source, text, exit_code, provenance_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                event_type, source, text, exit_code, provenance_json, state, step_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 event.event_id,
                 event.conversation_id,
@@ -259,6 +505,8 @@ class ExecutionEventStore:
                 event.text,
                 event.exit_code,
                 json.dumps(event.provenance, ensure_ascii=False),
+                event.state,
+                event.step_id,
             ),
         )
 
@@ -290,6 +538,8 @@ class ExecutionEventStore:
                         source=row["source"],
                         exit_code=row["exit_code"],
                         provenance=provenance,
+                        state=row["state"],
+                        step_id=row["step_id"],
                         event_id=row["event_id"],
                         created_at_utc=row["created_at_utc"],
                     )
@@ -321,6 +571,10 @@ def format_execution_event(event: ExecutionEvent) -> str:
     }
     provenance = " · ".join(f"{key}={value}" for key, value in event.provenance)
     title = labels.get(event.event_type, event.event_type.value.replace("_", " ").title())
+    if event.step_id:
+        title += f" · Schritt {event.step_id}"
+    if event.state:
+        title += f" · Zustand {event.state}"
     if event.exit_code is not None and event.event_type is not ExecutionEventType.EXIT_CODE:
         title += f" · Exit {event.exit_code}"
     details = f" · {provenance}" if provenance else ""
